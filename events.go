@@ -122,6 +122,9 @@ func (c *Client) Begin(ctx context.Context, opts BeginOptions) *Interaction {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if c == nil {
+		return &Interaction{ctx: ctx}
+	}
 	eventID := opts.EventID
 	if eventID == "" {
 		if generated, err := newEventID(); err == nil {

@@ -967,6 +967,26 @@ func TestNoopClientWithoutWriteKey(t *testing.T) {
 	}
 }
 
+func TestBeginIsNilSafe(t *testing.T) {
+	var client *Client
+
+	interaction := client.Begin(nil, BeginOptions{
+		UserID: "user-123",
+		Event:  "chat_message",
+		Input:  "hello",
+	})
+
+	if interaction == nil {
+		t.Fatalf("expected interaction")
+	}
+	if interaction.client != nil {
+		t.Fatalf("expected nil client on nil-safe interaction")
+	}
+	if interaction.ctx == nil {
+		t.Fatalf("expected background context")
+	}
+}
+
 func TestConcurrentUsageIsSafe(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
