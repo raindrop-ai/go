@@ -1,14 +1,14 @@
-# `raindrop-go`
+# Raindrop Go SDK
 
 Go SDK for Raindrop AI observability.
 
 ## Install
 
 ```bash
-go get github.com/invisible-tools/go-raindrop
+go get github.com/raindrop-ai/go
 ```
 
-Source code and releases live in this repository: [github.com/invisible-tools/go-raindrop](https://github.com/invisible-tools/go-raindrop).
+Source code and releases live in this repository: [github.com/raindrop-ai/go](https://github.com/raindrop-ai/go).
 
 ## Quick Start: Interaction API
 
@@ -25,7 +25,7 @@ import (
 	"context"
 	"log"
 
-	raindrop "github.com/invisible-tools/go-raindrop"
+	raindrop "github.com/raindrop-ai/go"
 )
 
 func main() {
@@ -244,4 +244,4 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-That tag format matches the module path `github.com/invisible-tools/go-raindrop`.
+That tag format matches the module path `github.com/raindrop-ai/go`.

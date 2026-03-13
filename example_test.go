@@ -3,7 +3,7 @@ package raindrop_test
 import (
 	"context"
 
-	raindrop "github.com/invisible-tools/go-raindrop"
+	raindrop "github.com/raindrop-ai/go"
 )
 
 func ExampleClient_TrackAI() {

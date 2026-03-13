@@ -1,3 +1,3 @@
-module github.com/invisible-tools/go-raindrop
+module github.com/raindrop-ai/go
 
 go 1.21

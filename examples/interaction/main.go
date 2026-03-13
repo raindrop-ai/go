@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	raindrop "github.com/invisible-tools/go-raindrop"
+	raindrop "github.com/raindrop-ai/go"
 )
 
 func main() {
