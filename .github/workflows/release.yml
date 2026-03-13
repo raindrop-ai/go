@@ -1,0 +1,43 @@
+name: Release Go SDK
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Verify tag matches SDK version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          code_version=$(sed -n 's/^const Version = "\(.*\)"/\1/p' version.go)
+          if [ "$tag_version" != "$code_version" ]; then
+            echo "Tag version $tag_version does not match version.go $code_version"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          name: "Go SDK ${{ github.ref_name }}"

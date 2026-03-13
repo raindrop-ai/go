@@ -1,0 +1,33 @@
+name: CI - Go SDK
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted=$(find . -name '*.go' -print0 | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run race tests
+        run: go test -race ./...
