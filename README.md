@@ -8,6 +8,8 @@ Go SDK for Raindrop AI observability.
 go get github.com/invisible-tools/go-raindrop
 ```
 
+Source code and releases live in this repository: [github.com/invisible-tools/go-raindrop](https://github.com/invisible-tools/go-raindrop).
+
 ## Quick Start: Interaction API
 
 The Go SDK follows the same core manual workflow as the TypeScript SDK:
@@ -235,7 +237,7 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 
 ## Versioning
 
-This module lives in a monorepo subdirectory. Release tags should use the Go subdirectory tag format:
+This repository uses normal Go module tagging:
 
 ```bash
 git tag v0.1.0
