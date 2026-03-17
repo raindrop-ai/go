@@ -1046,10 +1046,10 @@ func validOTLPPayload() exportTraceServiceRequest {
 	return exportTraceServiceRequest{
 		ResourceSpans: []resourceSpans{{
 			Resource: resource{Attributes: []otlpKeyValue{
-				{Key: "service.name", Value: otlpAnyValue{StringValue: "openrouter"}},
+				{Key: "service.name", Value: otlpAnyValue{StringValue: "upstream-llm"}},
 			}},
 			ScopeSpans: []scopeSpans{{
-				Scope: scope{Name: "openrouter", Version: "1.0"},
+				Scope: scope{Name: "upstream-llm", Version: "1.0"},
 				Spans: []otlpSpan{{
 					TraceID:           "dGVzdHRyYWNlaWQx",
 					SpanID:            "dGVzdHNwYW4x",
@@ -1104,8 +1104,8 @@ func TestOTLPHandlerForwardsValidPayload(t *testing.T) {
 			foundServiceName = attr.Value.StringValue
 		}
 	}
-	if foundServiceName != "openrouter" {
-		t.Fatalf("expected service.name=openrouter, got %q", foundServiceName)
+	if foundServiceName != "upstream-llm" {
+		t.Fatalf("expected service.name=upstream-llm, got %q", foundServiceName)
 	}
 }
 

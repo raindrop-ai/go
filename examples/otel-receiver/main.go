@@ -10,12 +10,12 @@ import (
 )
 
 // This example starts an HTTP server that receives OTLP/HTTP JSON traces
-// (e.g. from OpenRouter's broadcast feature) and forwards them to Raindrop.
+// and forwards them to Raindrop.
 //
 // Usage:
 //   RAINDROP_WRITE_KEY=rk_... go run .
 //
-// Then configure OpenRouter's OTLP broadcast endpoint to:
+// Then configure your OTLP trace source to send to:
 //   http://your-server:8090/v1/traces
 
 func main() {

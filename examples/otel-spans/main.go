@@ -21,33 +21,31 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
-const openRouterEndpoint = "https://openrouter.ai/api/v1/chat/completions"
+// OpenAI-compatible chat types (works with any OpenAI-compatible provider).
 
-type openRouterMessage struct {
+type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type openRouterChatRequest struct {
-	Model     string              `json:"model"`
-	Messages  []openRouterMessage `json:"messages"`
-	User      string              `json:"user,omitempty"`
-	SessionID string              `json:"session_id,omitempty"`
-	MaxTokens int                 `json:"max_tokens,omitempty"`
+type chatRequest struct {
+	Model     string        `json:"model"`
+	Messages  []chatMessage `json:"messages"`
+	MaxTokens int           `json:"max_tokens,omitempty"`
 }
 
-type openRouterChatResponse struct {
-	ID      string                 `json:"id"`
-	Model   string                 `json:"model"`
-	Choices []openRouterChatChoice `json:"choices"`
-	Usage   *openRouterUsage       `json:"usage"`
+type chatResponse struct {
+	ID      string       `json:"id"`
+	Model   string       `json:"model"`
+	Choices []chatChoice `json:"choices"`
+	Usage   *chatUsage   `json:"usage"`
 }
 
-type openRouterChatChoice struct {
-	Message openRouterMessage `json:"message"`
+type chatChoice struct {
+	Message chatMessage `json:"message"`
 }
 
-type openRouterUsage struct {
+type chatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
@@ -64,19 +62,19 @@ func main() {
 		log.Fatal("RAINDROP_WRITE_KEY is required")
 	}
 
-	openRouterKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
-	if openRouterKey == "" {
-		log.Fatal("OPENROUTER_API_KEY is required")
+	llmAPIKey := strings.TrimSpace(os.Getenv("LLM_API_KEY"))
+	if llmAPIKey == "" {
+		log.Fatal("LLM_API_KEY is required")
 	}
 
-	model := envOrDefault("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+	llmEndpoint := envOrDefault("LLM_ENDPOINT", "https://api.openai.com/v1/chat/completions")
+	model := envOrDefault("LLM_MODEL", "gpt-4o-mini")
 	userID := "user-123"
 	convoID := "conv-123"
 	prompt := "Plan a calm Saturday morning in San Francisco."
 
 	client, err := raindrop.New(
 		raindrop.WithWriteKey(writeKey),
-		raindrop.WithEndpoint("https://api.raindrop.ai/v1/"),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -88,21 +86,18 @@ func main() {
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(client.OTelSpanExporter()),
 		sdktrace.WithResource(sdkresource.NewSchemaless(
-			otelattribute.String("service.name", "openrouter-go-example"),
+			otelattribute.String("service.name", "otel-spans-example"),
 			otelattribute.String("service.version", raindrop.Version),
 		)),
 	)
 	defer func() { _ = tp.Shutdown(ctx) }()
 
-	tracer := tp.Tracer("github.com/raindrop-ai/go/examples/openrouter")
+	tracer := tp.Tracer("github.com/raindrop-ai/go/examples/otel-spans")
 	interaction := client.Begin(ctx, raindrop.BeginOptions{
 		UserID:  userID,
 		Event:   "chat_message",
 		Input:   prompt,
 		ConvoID: convoID,
-		Properties: map[string]any{
-			"llm.provider": "openrouter",
-		},
 	})
 
 	_, weatherSpan := tracer.Start(ctx, "weather_lookup",
@@ -120,15 +115,14 @@ func main() {
 	weatherSpan.SetAttributes(raindrop.OTelToolAttributes("weather_lookup", nil, weather, nil)...)
 	weatherSpan.End()
 
-	llmCtx, llmSpan := tracer.Start(ctx, "openrouter.chat.completion",
+	llmCtx, llmSpan := tracer.Start(ctx, "chat.completion",
 		oteltrace.WithSpanKind(oteltrace.SpanKindClient),
 		oteltrace.WithAttributes(
 			otelattribute.String("ai.telemetry.metadata.raindrop.eventId", interaction.EventID()),
-			otelattribute.String("ai.model.provider", "openrouter"),
 			otelattribute.String("gen_ai.request.model", model),
 		),
 	)
-	completion, err := createChatCompletion(llmCtx, httpClient, openRouterKey, model, userID, convoID, prompt, weather)
+	completion, err := createChatCompletion(llmCtx, httpClient, llmEndpoint, llmAPIKey, model, prompt, weather)
 	if err != nil {
 		llmSpan.RecordError(err)
 		llmSpan.SetStatus(otelcodes.Error, err.Error())
@@ -149,9 +143,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	properties := map[string]any{
-		"ai.model.provider": "openrouter",
-	}
+	properties := map[string]any{}
 	if completion.Usage != nil {
 		properties["gen_ai.usage.prompt_tokens"] = completion.Usage.PromptTokens
 		properties["gen_ai.usage.completion_tokens"] = completion.Usage.CompletionTokens
@@ -168,10 +160,10 @@ func main() {
 	fmt.Println(reply)
 }
 
-func createChatCompletion(ctx context.Context, httpClient *http.Client, apiKey, model, userID, convoID, prompt string, weather weatherResult) (openRouterChatResponse, error) {
-	reqBody := openRouterChatRequest{
+func createChatCompletion(ctx context.Context, httpClient *http.Client, endpoint, apiKey, model, prompt string, weather weatherResult) (chatResponse, error) {
+	reqBody := chatRequest{
 		Model: model,
-		Messages: []openRouterMessage{
+		Messages: []chatMessage{
 			{
 				Role:    "system",
 				Content: fmt.Sprintf("You are a helpful local planner. Weather context: %s, %dF.", weather.Forecast, weather.TemperatureF),
@@ -181,58 +173,50 @@ func createChatCompletion(ctx context.Context, httpClient *http.Client, apiKey, 
 				Content: prompt,
 			},
 		},
-		User:      userID,
-		SessionID: convoID,
 		MaxTokens: 300,
 	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return openRouterChatResponse{}, err
+		return chatResponse{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openRouterEndpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return openRouterChatResponse{}, err
+		return chatResponse{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	if referer := strings.TrimSpace(os.Getenv("OPENROUTER_HTTP_REFERER")); referer != "" {
-		req.Header.Set("HTTP-Referer", referer)
-	}
-	if title := strings.TrimSpace(os.Getenv("OPENROUTER_TITLE")); title != "" {
-		req.Header.Set("X-Title", title)
-	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return openRouterChatResponse{}, err
+		return chatResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return openRouterChatResponse{}, err
+		return chatResponse{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return openRouterChatResponse{}, fmt.Errorf("openrouter chat completion failed: %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
+		return chatResponse{}, fmt.Errorf("chat completion failed: %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
 	}
 
-	var decoded openRouterChatResponse
+	var decoded chatResponse
 	if err := json.Unmarshal(respBody, &decoded); err != nil {
-		return openRouterChatResponse{}, err
+		return chatResponse{}, err
 	}
 	return decoded, nil
 }
 
-func assistantText(response openRouterChatResponse) (string, error) {
+func assistantText(response chatResponse) (string, error) {
 	if len(response.Choices) == 0 {
-		return "", errors.New("openrouter returned no choices")
+		return "", errors.New("provider returned no choices")
 	}
 
 	text := strings.TrimSpace(response.Choices[0].Message.Content)
 	if text == "" {
-		return "", errors.New("openrouter returned an empty assistant message")
+		return "", errors.New("provider returned an empty assistant message")
 	}
 	return text, nil
 }

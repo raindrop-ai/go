@@ -44,8 +44,8 @@ func (e *OTelSpanExporter) Shutdown(context.Context) error {
 }
 
 // OTLPHandler returns an http.Handler that accepts OTLP/HTTP JSON trace
-// payloads (e.g. from OpenRouter's broadcast feature) and forwards them to
-// Raindrop. Mount it at your preferred path (typically "/v1/traces").
+// payloads and forwards them to Raindrop. Mount it at your preferred path
+// (typically "/v1/traces").
 func (c *Client) OTLPHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
