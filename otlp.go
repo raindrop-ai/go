@@ -151,6 +151,13 @@ func unixNanoString(at time.Time) string {
 	return strconv.FormatInt(at.UnixNano(), 10)
 }
 
+func defaultResourceAttributes(serviceName, serviceVersion string) []otlpKeyValue {
+	return []otlpKeyValue{
+		{Key: "service.name", Value: otlpAnyValue{StringValue: serviceName}},
+		{Key: "service.version", Value: otlpAnyValue{StringValue: serviceVersion}},
+	}
+}
+
 func buildExportTraceServiceRequest(spans []otlpSpan, serviceName, serviceVersion string) exportTraceServiceRequest {
 	return exportTraceServiceRequest{
 		ResourceSpans: []resourceSpans{
