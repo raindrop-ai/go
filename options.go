@@ -3,6 +3,7 @@ package raindrop
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -11,6 +12,8 @@ type Option func(*config) error
 type config struct {
 	writeKey             string
 	endpoint             string
+	localWorkshop        LocalWorkshopConfig
+	autoDetectLocal      bool
 	debug                bool
 	httpClient           *http.Client
 	partialFlushInterval time.Duration
@@ -30,6 +33,8 @@ type config struct {
 func defaultConfig() config {
 	return config{
 		endpoint:             DefaultEndpoint,
+		localWorkshop:        LocalWorkshopConfig{Inherit: true},
+		autoDetectLocal:      true,
 		httpClient:           &http.Client{Timeout: 15 * time.Second},
 		partialFlushInterval: time.Second,
 		traceFlushInterval:   time.Second,
@@ -56,6 +61,31 @@ func WithWriteKey(writeKey string) Option {
 func WithEndpoint(endpoint string) Option {
 	return func(cfg *config) error {
 		cfg.endpoint = formatEndpoint(endpoint)
+		return nil
+	}
+}
+
+// WithLocalWorkshopUrl pins the local Workshop daemon URL, suppressing env
+// vars and the auto-detect probe. Pass an empty string to revert to the
+// inherit-from-env default behavior.
+func WithLocalWorkshopUrl(url string) Option {
+	return func(cfg *config) error {
+		trimmed := strings.TrimSpace(url)
+		if trimmed == "" {
+			cfg.localWorkshop = LocalWorkshopConfig{Inherit: true}
+			return nil
+		}
+		cfg.localWorkshop = LocalWorkshopConfig{URL: trimmed}
+		return nil
+	}
+}
+
+// WithDisableLocalWorkshop opts out of the local mirror entirely, even if
+// `RAINDROP_LOCAL_DEBUGGER` / `RAINDROP_WORKSHOP` is set or a daemon is
+// listening on the default port.
+func WithDisableLocalWorkshop() Option {
+	return func(cfg *config) error {
+		cfg.localWorkshop = LocalWorkshopConfig{Disabled: true}
 		return nil
 	}
 }

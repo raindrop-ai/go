@@ -949,6 +949,7 @@ func TestNoopClientWithoutWriteKey(t *testing.T) {
 
 	client, err := New(
 		WithEndpoint(server.URL+"/"),
+		WithDisableLocalWorkshop(),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -1027,6 +1028,7 @@ func newTestClient(t *testing.T, endpoint string, opts ...Option) *Client {
 	allOpts := []Option{
 		WithWriteKey("rk_test"),
 		WithEndpoint(endpoint),
+		WithDisableLocalWorkshop(),
 		WithDebug(false),
 		WithPartialFlushInterval(0),
 		WithTraceFlushInterval(0),

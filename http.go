@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -15,9 +16,12 @@ import (
 
 type retryingHTTPClient struct {
 	baseURL        string
+	localBaseURL   string
 	writeKey       string
 	client         *http.Client
+	localClient    *http.Client
 	debug          bool
+	logger         *slog.Logger
 	maxAttempts    int
 	baseDelay      time.Duration
 	jitterFraction float64
@@ -39,12 +43,19 @@ func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("raindrop: %s: %s", e.Status, e.Body)
 }
 
-func newRetryingHTTPClient(cfg config) *retryingHTTPClient {
+func newRetryingHTTPClient(cfg config, localBaseURL string) *retryingHTTPClient {
+	var localClient *http.Client
+	if localBaseURL != "" {
+		localClient = &http.Client{Timeout: localMirrorTimeout}
+	}
 	return &retryingHTTPClient{
 		baseURL:        cfg.endpoint,
+		localBaseURL:   localBaseURL,
 		writeKey:       cfg.writeKey,
 		client:         cfg.httpClient,
+		localClient:    localClient,
 		debug:          cfg.debug,
+		logger:         cfg.logger,
 		maxAttempts:    cfg.retryMaxAttempts,
 		baseDelay:      cfg.retryBaseDelay,
 		jitterFraction: cfg.retryJitterFraction,
@@ -60,6 +71,12 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
+	}
+
+	c.postLocalMirror(path, payload)
+
+	if c.writeKey == "" {
+		return nil
 	}
 
 	url := c.baseURL + strings.TrimPrefix(path, "/")
@@ -117,6 +134,42 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 		return lastErr
 	}
 	return nil
+}
+
+// postLocalMirror is fire-and-forget: short timeout, no retries, errors
+// surfaced only via the debug logger so they never bubble into the cloud
+// retry path. Uses context.Background so a cancelled caller context can't
+// abort the mirror once we've decided to send it.
+func (c *retryingHTTPClient) postLocalMirror(path string, payload []byte) {
+	if c.localBaseURL == "" || c.localClient == nil {
+		return
+	}
+	url := c.localBaseURL + strings.TrimPrefix(path, "/")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		c.debugMirror("build local mirror request failed", "error", err)
+		return
+	}
+	if c.writeKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.writeKey)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.localClient.Do(req)
+	if err != nil {
+		c.debugMirror("local mirror POST failed", "error", err, "url", url)
+		return
+	}
+	if resp.StatusCode >= 400 {
+		c.debugMirror("local mirror POST returned non-2xx", "status", resp.StatusCode, "url", url)
+	}
+	_ = resp.Body.Close()
+}
+
+func (c *retryingHTTPClient) debugMirror(msg string, args ...any) {
+	if !c.debug || c.logger == nil {
+		return
+	}
+	c.logger.Debug(msg, args...)
 }
 
 func (c *retryingHTTPClient) retryDelay(retryNumber int, previous error) time.Duration {
