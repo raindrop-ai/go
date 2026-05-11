@@ -98,7 +98,7 @@ func TestFanOutKeyPlusLocalDualShips(t *testing.T) {
 	client := silentClient(t,
 		WithWriteKey("rk_test"),
 		WithEndpoint(cloud.URL+"/"),
-		WithLocalWorkshopUrl(local.URL+"/"),
+		WithLocalWorkshopURL(local.URL+"/"),
 	)
 	defer func() { _ = client.Close() }()
 
@@ -134,7 +134,7 @@ func TestFanOutLocalOnlyWhenNoKey(t *testing.T) {
 
 	client := silentClient(t,
 		WithEndpoint(cloud.URL+"/"),
-		WithLocalWorkshopUrl(local.URL+"/"),
+		WithLocalWorkshopURL(local.URL+"/"),
 	)
 	defer func() { _ = client.Close() }()
 
@@ -180,7 +180,7 @@ func TestFanOutLocalFailureDoesNotBreakCloud(t *testing.T) {
 	client := silentClient(t,
 		WithWriteKey("rk_test"),
 		WithEndpoint(cloud.URL+"/"),
-		WithLocalWorkshopUrl(local.URL+"/"),
+		WithLocalWorkshopURL(local.URL+"/"),
 	)
 	defer func() { _ = client.Close() }()
 
@@ -210,7 +210,7 @@ func TestFanOutLocalReturns500DoesNotBreakCloud(t *testing.T) {
 	client := silentClient(t,
 		WithWriteKey("rk_test"),
 		WithEndpoint(cloud.URL+"/"),
-		WithLocalWorkshopUrl(local.URL+"/"),
+		WithLocalWorkshopURL(local.URL+"/"),
 	)
 	defer func() { _ = client.Close() }()
 
@@ -247,7 +247,7 @@ func TestFanOutTracesAlsoMirror(t *testing.T) {
 	client := silentClient(t,
 		WithWriteKey("rk_test"),
 		WithEndpoint(cloud.URL+"/"),
-		WithLocalWorkshopUrl(local.URL+"/"),
+		WithLocalWorkshopURL(local.URL+"/"),
 	)
 	defer func() { _ = client.Close() }()
 
@@ -270,7 +270,7 @@ func TestNewLocalOnlyClientIsEnabled(t *testing.T) {
 	t.Setenv(WorkshopEnvVar, "")
 
 	client, err := New(
-		WithLocalWorkshopUrl("http://workshop.local:5899/v1/"),
+		WithLocalWorkshopURL("http://workshop.local:5899/v1/"),
 		WithDebug(false),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
@@ -351,7 +351,7 @@ func TestEventBufferGoroutineRunsForLocalOnlyClient(t *testing.T) {
 	defer local.Close()
 
 	client, err := New(
-		WithLocalWorkshopUrl(local.URL+"/"),
+		WithLocalWorkshopURL(local.URL+"/"),
 		WithPartialFlushInterval(10*time.Millisecond),
 		WithDebug(false),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),

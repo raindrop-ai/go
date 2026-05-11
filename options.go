@@ -65,10 +65,10 @@ func WithEndpoint(endpoint string) Option {
 	}
 }
 
-// WithLocalWorkshopUrl pins the local Workshop daemon URL, suppressing env
+// WithLocalWorkshopURL pins the local Workshop daemon URL, suppressing env
 // vars and the auto-detect probe. Pass an empty string to revert to the
 // inherit-from-env default behavior.
-func WithLocalWorkshopUrl(url string) Option {
+func WithLocalWorkshopURL(url string) Option {
 	return func(cfg *config) error {
 		trimmed := strings.TrimSpace(url)
 		if trimmed == "" {

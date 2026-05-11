@@ -9,8 +9,14 @@ import (
 )
 
 const (
-	LocalDebuggerEnvVar     = "RAINDROP_LOCAL_DEBUGGER"
-	WorkshopEnvVar          = "RAINDROP_WORKSHOP"
+	// LocalDebuggerEnvVar names the env var that pins the local mirror to a
+	// specific URL, taking precedence over RAINDROP_WORKSHOP and the probe.
+	LocalDebuggerEnvVar = "RAINDROP_LOCAL_DEBUGGER"
+	// WorkshopEnvVar names the env var that either pins the local mirror URL
+	// or toggles it on/off via boolean strings (1/true/yes/on, 0/false/no/off).
+	WorkshopEnvVar = "RAINDROP_WORKSHOP"
+	// DefaultLocalWorkshopURL is the URL used when the local mirror is enabled
+	// without an explicit URL (probe hit, RAINDROP_WORKSHOP=1, etc.).
 	DefaultLocalWorkshopURL = "http://localhost:5899/v1/"
 )
 
@@ -36,12 +42,12 @@ type LocalWorkshopConfig struct {
 // ResolveLocalWorkshopURL applies the cross-language precedence rules and
 // returns the URL to mirror cloud POSTs to ("" when local is disabled).
 //
-//	1. explicit URL (cfg.URL)
-//	2. explicit opt-out (cfg.Disabled)
-//	3. RAINDROP_LOCAL_DEBUGGER env var
-//	4. RAINDROP_WORKSHOP env var (URL or boolean)
-//	5. TCP probe of 127.0.0.1:5899 when autoDetect
-//	6. ""
+//  1. explicit URL (cfg.URL)
+//  2. explicit opt-out (cfg.Disabled)
+//  3. RAINDROP_LOCAL_DEBUGGER env var
+//  4. RAINDROP_WORKSHOP env var (URL or boolean)
+//  5. TCP probe of 127.0.0.1:5899 when autoDetect
+//  6. ""
 func ResolveLocalWorkshopURL(cfg LocalWorkshopConfig, autoDetect bool) string {
 	if cfg.Disabled {
 		return ""

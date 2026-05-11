@@ -136,10 +136,11 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 	return nil
 }
 
-// postLocalMirror is fire-and-forget: short timeout, no retries, errors
-// surfaced only via the debug logger so they never bubble into the cloud
-// retry path. Uses context.Background so a cancelled caller context can't
-// abort the mirror once we've decided to send it.
+// postLocalMirror runs synchronously but does not propagate errors: the
+// 2s client timeout caps the worst-case latency added to every cloud POST,
+// failures are surfaced only via the debug logger, and a cancelled caller
+// context can't abort the mirror once we've decided to send it. This
+// matches the Python SDK's _post_local_mirror semantics.
 func (c *retryingHTTPClient) postLocalMirror(path string, payload []byte) {
 	if c.localBaseURL == "" || c.localClient == nil {
 		return
