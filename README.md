@@ -211,8 +211,10 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 
 ## Options
 
-- `WithWriteKey(string)`: Sets the Raindrop write key. If omitted, the client becomes a noop client.
+- `WithWriteKey(string)`: Sets the Raindrop write key. When empty and no local Workshop URL resolves, the client becomes a no-op.
 - `WithEndpoint(string)`: Overrides the base API endpoint. Defaults to `https://api.raindrop.ai/v1/`.
+- `WithLocalWorkshopURL(string)`: Pins the local Workshop daemon URL, suppressing env vars and the auto-detect probe. Pass an empty string to revert to inherit-from-env behavior.
+- `WithDisableLocalWorkshop()`: Opts out of the local mirror entirely, even if `RAINDROP_LOCAL_DEBUGGER` / `RAINDROP_WORKSHOP` is set or a daemon is listening on the default port.
 - `WithDebug(bool)`: Enables debug logging.
 - `WithHTTPClient(*http.Client)`: Uses a custom HTTP client.
 - `WithPartialFlushInterval(time.Duration)`: Sets the periodic pending-event flush interval. Defaults to `1s`.
@@ -224,6 +226,21 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - `WithLibraryVersion(string)`: Overrides the `$context.library.version` event metadata.
 - `WithLogger(*slog.Logger)`: Uses a custom structured logger.
 
+## Local Workshop Mirror
+
+When a local Workshop daemon URL resolves, every cloud-bound POST is also mirrored to the local URL so events show up in a local Workshop instance during development.
+
+Resolution precedence (highest priority first):
+
+1. `WithLocalWorkshopURL(url)` option
+2. `WithDisableLocalWorkshop()` option (suppresses env + probe)
+3. `RAINDROP_LOCAL_DEBUGGER` env var (URL)
+4. `RAINDROP_WORKSHOP` env var (URL or boolean: `1`/`true`/`yes`/`on` enables the default URL; `0`/`false`/`no`/`off` disables)
+5. TCP probe of `127.0.0.1:5899` with a 100ms timeout (one-time, at `New()`)
+6. None of the above &rarr; local mirror disabled
+
+The local POST uses a 2s timeout, no retries, and errors are logged at `debug` level only so a slow or broken local daemon never affects the cloud path. When `WithWriteKey` is empty but a local URL resolves, the client ships to the local mirror only.
+
 ## Behavior
 
 - Events are sent to `/events/track_partial`.
@@ -233,7 +250,7 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - Traces are sent as OTLP JSON to `/traces`.
 - `Begin()`/`Finish()` is the recommended flow for new code.
 - `ResumeInteraction()` is only for recovering an active interaction handle in the same process.
-- Empty `writeKey` disables all shipping without raising errors.
+- Empty `writeKey` with no local Workshop URL resolved disables all shipping without raising errors.
 
 ## Versioning
 

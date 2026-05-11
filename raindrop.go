@@ -49,11 +49,12 @@ func New(opts ...Option) (*Client, error) {
 
 	cfg.writeKey = strings.TrimSpace(cfg.writeKey)
 	cfg.endpoint = formatEndpoint(cfg.endpoint)
+	resolvedLocal := ResolveLocalWorkshopURL(cfg.localWorkshop, cfg.autoDetectLocal)
 
 	client := &Client{
 		logger:      cfg.logger,
 		debug:       cfg.debug,
-		enabled:     cfg.writeKey != "",
+		enabled:     cfg.writeKey != "" || resolvedLocal != "",
 		serviceName: cfg.serviceName,
 		version:     cfg.serviceVersion,
 		contextData: map[string]any{
@@ -68,12 +69,17 @@ func New(opts ...Option) (*Client, error) {
 		},
 	}
 
-	client.transport = newRetryingHTTPClient(cfg)
+	client.transport = newRetryingHTTPClient(cfg, resolvedLocal)
 	client.events = newEventBuffer(client, cfg.partialFlushInterval)
 	client.traces = newTraceBuffer(client, cfg.traceFlushInterval, cfg.traceBatchSize, cfg.traceQueueSize)
 
-	if !client.enabled {
-		client.debugLog("writeKey not provided; telemetry shipping is disabled")
+	switch {
+	case cfg.writeKey == "" && resolvedLocal == "":
+		client.debugLog("writeKey not provided and no local Workshop URL resolved; telemetry shipping is disabled")
+	case cfg.writeKey == "":
+		client.debugLog("writeKey not provided; shipping locally only", "local_workshop_url", resolvedLocal)
+	case resolvedLocal != "":
+		client.debugLog("dual-shipping cloud + local Workshop", "local_workshop_url", resolvedLocal)
 	}
 
 	return client, nil
