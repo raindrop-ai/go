@@ -14,6 +14,20 @@ import (
 	"time"
 )
 
+// Outbound HTTP bounds: telemetry must never wedge the host app. Every
+// attempt carries a finite deadline even when the caller injected an
+// http.Client without a Timeout, and server-controlled Retry-After values
+// are clamped so a misbehaving endpoint cannot park a flush goroutine.
+const (
+	// defaultAttemptTimeout bounds a single POST attempt when neither the
+	// configured http.Client nor the caller's context imposes a deadline
+	// (http.Client zero value has NO timeout).
+	defaultAttemptTimeout = 30 * time.Second
+	// maxRetryAfterDelay caps how long a server-provided Retry-After header
+	// can delay the next attempt.
+	maxRetryAfterDelay = 30 * time.Second
+)
+
 type retryingHTTPClient struct {
 	baseURL        string
 	localBaseURL   string
@@ -25,6 +39,7 @@ type retryingHTTPClient struct {
 	maxAttempts    int
 	baseDelay      time.Duration
 	jitterFraction float64
+	attemptTimeout time.Duration
 	sleep          func(context.Context, time.Duration) error
 	randomFloat    func() float64
 }
@@ -59,6 +74,7 @@ func newRetryingHTTPClient(cfg config, localBaseURL string) *retryingHTTPClient 
 		maxAttempts:    cfg.retryMaxAttempts,
 		baseDelay:      cfg.retryBaseDelay,
 		jitterFraction: cfg.retryJitterFraction,
+		attemptTimeout: defaultAttemptTimeout,
 		sleep:          sleepContext,
 		randomFloat:    rand.Float64,
 	}
@@ -73,7 +89,7 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 		return err
 	}
 
-	c.postLocalMirror(path, payload)
+	c.postLocalMirror(ctx, path, payload)
 
 	if c.writeKey == "" {
 		return nil
@@ -92,42 +108,11 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-		if err != nil {
+		done, err := c.postOnce(ctx, url, payload)
+		if done {
 			return err
 		}
-		req.Header.Set("Authorization", "Bearer "+c.writeKey)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.client.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			lastErr = err
-			continue
-		}
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			_ = resp.Body.Close()
-			return nil
-		}
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-
-		statusErr := &httpStatusError{
-			StatusCode: resp.StatusCode,
-			Status:     resp.Status,
-			Body:       strings.TrimSpace(string(bodyBytes)),
-			RetryAfter: parseRetryAfter(resp.Header),
-		}
-
-		if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
-			return statusErr
-		}
-
-		lastErr = statusErr
+		lastErr = err
 	}
 
 	if lastErr != nil {
@@ -136,17 +121,84 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 	return nil
 }
 
+// postOnce performs a single POST attempt. done reports whether the retry
+// loop should stop (success, permanent failure, or caller context done);
+// when done is false the returned error is the retryable lastErr.
+func (c *retryingHTTPClient) postOnce(ctx context.Context, url string, payload []byte) (done bool, err error) {
+	// Bound the attempt even when the configured http.Client carries no
+	// Timeout (the zero value is unbounded — a stalled connection would hang
+	// the flush goroutine, and Close, forever). context deadlines compose,
+	// so an earlier caller deadline still wins.
+	attemptCtx := ctx
+	if c.client.Timeout == 0 {
+		var cancel context.CancelFunc
+		attemptCtx, cancel = context.WithTimeout(ctx, c.attemptTimeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return true, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.writeKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			// The CALLER's context ended; per-attempt timeouts surface as a
+			// retryable error instead.
+			return true, ctx.Err()
+		}
+		return false, err
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		_ = resp.Body.Close()
+		return true, nil
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	statusErr := &httpStatusError{
+		StatusCode: resp.StatusCode,
+		Status:     resp.Status,
+		Body:       strings.TrimSpace(string(bodyBytes)),
+		RetryAfter: parseRetryAfter(resp.Header),
+	}
+
+	if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+		return true, statusErr
+	}
+
+	return false, statusErr
+}
+
 // postLocalMirror runs synchronously but does not propagate errors: the
 // 2s client timeout caps the worst-case latency added to every cloud POST,
 // failures are surfaced only via the debug logger, and a cancelled caller
 // context can't abort the mirror once we've decided to send it. This
-// matches the Python SDK's _post_local_mirror semantics.
-func (c *retryingHTTPClient) postLocalMirror(path string, payload []byte) {
+// matches the Python SDK's _post_local_mirror semantics. Wall deadlines are
+// honored, though: during Close the mirror obeys the remaining shutdown
+// budget instead of adding up to 2s per queued payload past it.
+func (c *retryingHTTPClient) postLocalMirror(ctx context.Context, path string, payload []byte) {
 	if c.localBaseURL == "" || c.localClient == nil {
 		return
 	}
+	if ctx.Err() != nil {
+		c.debugMirror("local mirror skipped: context done", "error", ctx.Err())
+		return
+	}
+	// Detach from the caller's cancellation but keep its deadline.
+	mirrorCtx := context.Background()
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		mirrorCtx, cancel = context.WithDeadline(mirrorCtx, deadline)
+		defer cancel()
+	}
 	url := c.localBaseURL + strings.TrimPrefix(path, "/")
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(mirrorCtx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		c.debugMirror("build local mirror request failed", "error", err)
 		return
@@ -175,7 +227,9 @@ func (c *retryingHTTPClient) debugMirror(msg string, args ...any) {
 
 func (c *retryingHTTPClient) retryDelay(retryNumber int, previous error) time.Duration {
 	if statusErr, ok := previous.(*httpStatusError); ok && statusErr.RetryAfter > 0 {
-		return statusErr.RetryAfter
+		// Clamp server-controlled values: an arbitrary Retry-After (hours,
+		// days) would otherwise park the flush goroutine for that long.
+		return min(statusErr.RetryAfter, maxRetryAfterDelay)
 	}
 
 	delay := c.baseDelay << (retryNumber - 1)

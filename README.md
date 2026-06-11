@@ -10,6 +10,28 @@ go get github.com/raindrop-ai/go
 
 Source code and releases live in this repository: [github.com/raindrop-ai/go](https://github.com/raindrop-ai/go).
 
+## Payload size limits
+
+As of `v0.1.4`, text fields (event input/output, event property and
+attachment values, tool span I/O, stringified span properties) are capped at
+**1,000,000 bytes per field by default** and
+truncated with a `...[truncated by raindrop]` marker. The cap is enforced
+before serialization, so oversized payloads cost the cap — not the payload —
+on your calling goroutine, and large events land truncated instead of being
+rejected at the ingest size limit. Tune it via:
+
+```go
+client, err := raindrop.New(
+	raindrop.WithWriteKey("rk_..."),
+	raindrop.WithMaxTextFieldChars(250_000),
+)
+```
+
+All outbound HTTP carries finite deadlines — even when a custom
+`WithHTTPClient` has no `Timeout` — and `Close()` runs its final flush under
+a hard deadline (`WithCloseTimeout`, default 10s) so a dead network can
+never wedge your process exit.
+
 ## Quick Start: Interaction API
 
 The Go SDK follows the same core manual workflow as the TypeScript SDK:
@@ -224,6 +246,8 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - `WithServiceName(string)`: Overrides the OTLP service name. Defaults to `raindrop.go-sdk`.
 - `WithServiceVersion(string)`: Overrides the OTLP service version and default library version.
 - `WithLibraryVersion(string)`: Overrides the `$context.library.version` event metadata.
+- `WithMaxTextFieldChars(int)`: Sets the per-field byte cap applied to event input/output, event property and attachment values, and serialized tool span content before serialization. Defaults to `1000000`. Non-positive values are ignored.
+- `WithCloseTimeout(time.Duration)`: Sets the hard deadline for `Close()`'s final flush; once it passes, in-flight sends are aborted and remaining payloads are dropped. Defaults to `10s`. Non-positive values are ignored.
 - `WithLogger(*slog.Logger)`: Uses a custom structured logger.
 
 ## Local Workshop Mirror
