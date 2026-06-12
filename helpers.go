@@ -2,7 +2,6 @@ package raindrop
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -74,21 +73,4 @@ func newEventID() (string, error) {
 		buf[8:10],
 		buf[10:16],
 	), nil
-}
-
-func stringifyValue(value any) string {
-	switch typed := value.(type) {
-	case nil:
-		return ""
-	case string:
-		return typed
-	case []byte:
-		return string(typed)
-	default:
-		encoded, err := json.Marshal(value)
-		if err == nil {
-			return string(encoded)
-		}
-		return fmt.Sprint(value)
-	}
 }

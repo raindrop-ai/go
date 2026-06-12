@@ -177,16 +177,20 @@ func (c *Client) Patch(ctx context.Context, eventID string, opts PatchOptions) e
 		return nil
 	}
 
+	// Cap text fields BEFORE buffering so multi-MB inputs, outputs, property
+	// values, and attachment values never enter the merge/serialize pipeline
+	// at full size: the cost on the caller stays proportional to the cap.
+	limit := c.textFieldLimit()
 	return c.events.Patch(ctx, eventID, eventPatch{
 		EventName:   opts.Event,
 		UserID:      opts.UserID,
 		Timestamp:   opts.Timestamp,
-		Input:       opts.Input,
-		Output:      opts.Output,
+		Input:       capText(opts.Input, limit),
+		Output:      capText(opts.Output, limit),
 		Model:       opts.Model,
 		ConvoID:     opts.ConvoID,
-		Properties:  cloneMap(opts.Properties),
-		Attachments: cloneAttachments(opts.Attachments),
+		Properties:  capProperties(opts.Properties, limit),
+		Attachments: capAttachments(opts.Attachments, limit),
 		IsPending:   opts.IsPending,
 	})
 }

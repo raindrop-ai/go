@@ -71,17 +71,33 @@ type traceBuffer struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	// kickCh hands batch-threshold flushes to the run goroutine: Span.End()
+	// must stay O(1) on the caller — a synchronous flush there would block
+	// the host's hot path on a network round trip (with retries) whenever a
+	// span happens to fill the batch.
+	kickCh chan struct{}
+
+	// runCtx scopes background flushes; Stop cancels it so an in-flight
+	// flush against a hung server aborts immediately (the batch is restored
+	// and re-sent by Stop's own bounded flush).
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 type spanContextKey struct{}
 
 func newTraceBuffer(client *Client, flushEvery time.Duration, maxBatchSize, maxQueueSize int) *traceBuffer {
+	runCtx, runCancel := context.WithCancel(context.Background())
 	buffer := &traceBuffer{
 		client:       client,
 		maxBatchSize: maxBatchSize,
 		maxQueueSize: maxQueueSize,
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
+		kickCh:       make(chan struct{}, 1),
+		runCtx:       runCtx,
+		runCancel:    runCancel,
 	}
 	if client != nil && client.enabled && flushEvery > 0 {
 		buffer.ticker = time.NewTicker(flushEvery)
@@ -100,7 +116,9 @@ func (b *traceBuffer) run() {
 			}
 			return
 		case <-b.ticker.C:
-			_ = b.Flush(context.Background())
+			_ = b.Flush(b.runCtx)
+		case <-b.kickCh:
+			_ = b.Flush(b.runCtx)
 		}
 	}
 }
@@ -116,7 +134,19 @@ func (b *traceBuffer) Enqueue(span otlpSpan) {
 	b.mu.Unlock()
 
 	if flushNow {
-		_ = b.Flush(context.Background())
+		if b.ticker != nil {
+			// Wake the run goroutine; never flush synchronously on the
+			// caller's goroutine. Dropped sends are fine: a kick is already
+			// pending and the queue is re-checked after every flush.
+			select {
+			case b.kickCh <- struct{}{}:
+			default:
+			}
+		} else {
+			// No run goroutine (periodic flushing disabled): fall back to
+			// the synchronous flush so the queue cap still holds.
+			_ = b.Flush(context.Background())
+		}
 	}
 }
 
@@ -135,9 +165,13 @@ func (b *traceBuffer) Flush(ctx context.Context) error {
 	}
 }
 
+// Stop halts the background flusher and runs a final flush bounded by ctx.
+// An in-flight background flush is cancelled rather than awaited: its batch
+// is restored to the queue and re-sent here under the caller's deadline.
 func (b *traceBuffer) Stop(ctx context.Context) error {
 	b.stopOnce.Do(func() {
 		close(b.stopCh)
+		b.runCancel()
 	})
 	if b.ticker != nil {
 		<-b.doneCh
@@ -211,7 +245,7 @@ func (c *Client) StartSpan(ctx context.Context, opts SpanOptions) *Span {
 		name:    opts.Name,
 		eventID: opts.EventID,
 		start:   start,
-		attrs:   append(append([]Attribute{}, opts.Attributes...), toolPropertyAttributes(opts.Properties)...),
+		attrs:   append(append([]Attribute{}, opts.Attributes...), toolPropertyAttributes(opts.Properties, c.textFieldLimit())...),
 	}
 	return span
 }
@@ -288,7 +322,7 @@ func (i *Interaction) StartToolSpan(name string, opts ToolOptions) *ToolSpan {
 		EventID:    i.eventID,
 		Parent:     opts.Parent,
 		StartTime:  opts.StartTime,
-		Attributes: buildToolAttributes(name, opts.Input, nil, 0, properties),
+		Attributes: buildToolAttributes(name, opts.Input, nil, 0, properties, i.client.textFieldLimit()),
 	})
 	return &ToolSpan{
 		span:  span,
@@ -341,7 +375,7 @@ func (t *Tracer) TrackTool(opts TrackToolOptions) {
 		Name:       opts.Name,
 		Parent:     opts.Parent,
 		StartTime:  startTime,
-		Attributes: buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, opts.Properties),
+		Attributes: buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, opts.Properties, t.client.textFieldLimit()),
 	})
 	if opts.Error != nil {
 		span.SetError(opts.Error)
@@ -463,7 +497,7 @@ func (s *ToolSpan) SetInput(input any) {
 	}
 	s.input = input
 	if s.span != nil {
-		s.span.SetAttributes(StringAttr("traceloop.entity.input", stringifyValue(input)))
+		s.span.SetAttributes(StringAttr("traceloop.entity.input", stringifyValue(input, s.span.client.textFieldLimit())))
 	}
 }
 
@@ -473,7 +507,7 @@ func (s *ToolSpan) SetOutput(output any) {
 	}
 	s.output = output
 	if s.span != nil {
-		s.span.SetAttributes(StringAttr("traceloop.entity.output", stringifyValue(output)))
+		s.span.SetAttributes(StringAttr("traceloop.entity.output", stringifyValue(output, s.span.client.textFieldLimit())))
 	}
 }
 
@@ -525,25 +559,28 @@ func WithTool[T any](interaction *Interaction, name string, opts ToolOptions, fn
 	return result, nil
 }
 
-func buildToolAttributes(name string, input any, output any, duration time.Duration, properties map[string]any) []Attribute {
+// buildToolAttributes serializes tool I/O on the caller's goroutine, so every
+// stringified value is bounded by limit (see stringifyValue): cost stays
+// proportional to the cap even for multi-MB tool payloads.
+func buildToolAttributes(name string, input any, output any, duration time.Duration, properties map[string]any, limit int) []Attribute {
 	attrs := []Attribute{
 		StringAttr("traceloop.span.kind", "tool"),
 		StringAttr("traceloop.entity.name", name),
 	}
 	if input != nil {
-		attrs = append(attrs, StringAttr("traceloop.entity.input", stringifyValue(input)))
+		attrs = append(attrs, StringAttr("traceloop.entity.input", stringifyValue(input, limit)))
 	}
 	if output != nil {
-		attrs = append(attrs, StringAttr("traceloop.entity.output", stringifyValue(output)))
+		attrs = append(attrs, StringAttr("traceloop.entity.output", stringifyValue(output, limit)))
 	}
 	if duration > 0 {
 		attrs = append(attrs, IntAttr("traceloop.entity.duration_ms", duration.Milliseconds()))
 	}
-	attrs = append(attrs, toolPropertyAttributes(properties)...)
+	attrs = append(attrs, toolPropertyAttributes(properties, limit)...)
 	return attrs
 }
 
-func toolPropertyAttributes(properties map[string]any) []Attribute {
+func toolPropertyAttributes(properties map[string]any, limit int) []Attribute {
 	if len(properties) == 0 {
 		return nil
 	}
@@ -555,7 +592,7 @@ func toolPropertyAttributes(properties map[string]any) []Attribute {
 		attrKey := "traceloop.association.properties." + key
 		switch typed := value.(type) {
 		case string:
-			attrs = append(attrs, StringAttr(attrKey, typed))
+			attrs = append(attrs, StringAttr(attrKey, capText(typed, limit)))
 		case bool:
 			attrs = append(attrs, BoolAttr(attrKey, typed))
 		case int:
@@ -580,7 +617,7 @@ func toolPropertyAttributes(properties map[string]any) []Attribute {
 			if typed <= uint64(^uint64(0)>>1) {
 				attrs = append(attrs, IntAttr(attrKey, int64(typed)))
 			} else {
-				attrs = append(attrs, StringAttr(attrKey, stringifyValue(typed)))
+				attrs = append(attrs, StringAttr(attrKey, stringifyValue(typed, limit)))
 			}
 		case float32:
 			attrs = append(attrs, FloatAttr(attrKey, float64(typed)))
@@ -589,7 +626,7 @@ func toolPropertyAttributes(properties map[string]any) []Attribute {
 		case []string:
 			attrs = append(attrs, StringSliceAttr(attrKey, typed))
 		default:
-			attrs = append(attrs, StringAttr(attrKey, stringifyValue(typed)))
+			attrs = append(attrs, StringAttr(attrKey, stringifyValue(typed, limit)))
 		}
 	}
 	return attrs

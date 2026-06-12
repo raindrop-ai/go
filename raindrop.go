@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -14,20 +15,26 @@ const (
 	defaultLibraryName = "raindrop-go"
 	defaultServiceName = "raindrop.go-sdk"
 	defaultEventName   = "ai_generation"
+
+	// defaultCloseTimeout bounds Close's final flush so a dead or slow
+	// network can never wedge the host process's exit path.
+	defaultCloseTimeout = 10 * time.Second
 )
 
 var ErrClosed = errors.New("raindrop: client closed")
 
 type Client struct {
-	transport   *retryingHTTPClient
-	events      *eventBuffer
-	traces      *traceBuffer
-	logger      *slog.Logger
-	debug       bool
-	enabled     bool
-	serviceName string
-	version     string
-	contextData map[string]any
+	transport         *retryingHTTPClient
+	events            *eventBuffer
+	traces            *traceBuffer
+	logger            *slog.Logger
+	debug             bool
+	enabled           bool
+	serviceName       string
+	version           string
+	contextData       map[string]any
+	maxTextFieldChars int
+	closeTimeout      time.Duration
 
 	closeOnce sync.Once
 	closed    bool
@@ -52,11 +59,13 @@ func New(opts ...Option) (*Client, error) {
 	resolvedLocal := ResolveLocalWorkshopURL(cfg.localWorkshop, cfg.autoDetectLocal)
 
 	client := &Client{
-		logger:      cfg.logger,
-		debug:       cfg.debug,
-		enabled:     cfg.writeKey != "" || resolvedLocal != "",
-		serviceName: cfg.serviceName,
-		version:     cfg.serviceVersion,
+		logger:            cfg.logger,
+		debug:             cfg.debug,
+		enabled:           cfg.writeKey != "" || resolvedLocal != "",
+		serviceName:       cfg.serviceName,
+		version:           cfg.serviceVersion,
+		maxTextFieldChars: cfg.maxTextFieldChars,
+		closeTimeout:      cfg.closeTimeout,
 		contextData: map[string]any{
 			"library": map[string]any{
 				"name":    cfg.libraryName,
@@ -106,6 +115,11 @@ func (c *Client) Flush(ctx context.Context) error {
 	return nil
 }
 
+// Close flushes pending telemetry and stops the background goroutines,
+// under a hard overall deadline (WithCloseTimeout, default 10s): typically
+// called on the host's shutdown path, it must never wedge process exit on a
+// dead or slow network. Once the deadline passes, in-flight sends are
+// aborted and remaining payloads are dropped.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
@@ -117,7 +131,12 @@ func (c *Client) Close() error {
 		c.closed = true
 		c.closeMu.Unlock()
 
-		ctx := context.Background()
+		timeout := c.closeTimeout
+		if timeout <= 0 {
+			timeout = defaultCloseTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
 		closeErr = errors.Join(c.events.Stop(ctx), c.traces.Stop(ctx))
 	})
 	return closeErr

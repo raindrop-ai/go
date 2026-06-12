@@ -37,15 +37,25 @@ type eventBuffer struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	// runCtx scopes background ticker flushes. Stop cancels it so an
+	// in-flight flush against a hung server aborts immediately (the failed
+	// events are restored and re-sent by Stop's own bounded flush) instead
+	// of blocking Stop's wait on doneCh without a deadline.
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 func newEventBuffer(client *Client, flushEvery time.Duration) *eventBuffer {
+	runCtx, runCancel := context.WithCancel(context.Background())
 	buffer := &eventBuffer{
-		client:  client,
-		buffers: make(map[string]eventPatch),
-		sticky:  make(map[string]stickyEventData),
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		client:    client,
+		buffers:   make(map[string]eventPatch),
+		sticky:    make(map[string]stickyEventData),
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		runCtx:    runCtx,
+		runCancel: runCancel,
 	}
 	if client != nil && client.enabled && flushEvery > 0 {
 		buffer.ticker = time.NewTicker(flushEvery)
@@ -64,7 +74,7 @@ func (b *eventBuffer) run() {
 			}
 			return
 		case <-b.ticker.C:
-			_ = b.Flush(context.Background())
+			_ = b.Flush(b.runCtx)
 		}
 	}
 }
@@ -113,9 +123,13 @@ func (b *eventBuffer) Flush(ctx context.Context) error {
 	return firstErr
 }
 
+// Stop halts the background flusher and runs a final flush bounded by ctx.
+// An in-flight ticker flush is cancelled rather than awaited: its events are
+// restored to the buffer and re-sent here under the caller's deadline.
 func (b *eventBuffer) Stop(ctx context.Context) error {
 	b.stopOnce.Do(func() {
 		close(b.stopCh)
+		b.runCancel()
 	})
 	if b.ticker != nil {
 		<-b.doneCh

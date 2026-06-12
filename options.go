@@ -28,6 +28,8 @@ type config struct {
 	retryMaxAttempts     int
 	retryBaseDelay       time.Duration
 	retryJitterFraction  float64
+	maxTextFieldChars    int
+	closeTimeout         time.Duration
 }
 
 func defaultConfig() config {
@@ -35,7 +37,7 @@ func defaultConfig() config {
 		endpoint:             DefaultEndpoint,
 		localWorkshop:        LocalWorkshopConfig{Inherit: true},
 		autoDetectLocal:      true,
-		httpClient:           &http.Client{Timeout: 15 * time.Second},
+		httpClient:           &http.Client{Timeout: 30 * time.Second},
 		partialFlushInterval: time.Second,
 		traceFlushInterval:   time.Second,
 		traceBatchSize:       50,
@@ -48,6 +50,8 @@ func defaultConfig() config {
 		retryMaxAttempts:     3,
 		retryBaseDelay:       time.Second,
 		retryJitterFraction:  0.2,
+		maxTextFieldChars:    defaultMaxTextFieldChars,
+		closeTimeout:         defaultCloseTimeout,
 	}
 }
 
@@ -165,6 +169,34 @@ func WithLibraryVersion(version string) Option {
 	return func(cfg *config) error {
 		if version != "" {
 			cfg.libraryVersion = version
+		}
+		return nil
+	}
+}
+
+// WithCloseTimeout sets the hard deadline for Close's final flush. A dead or
+// slow network must never wedge process exit: once the deadline passes,
+// in-flight sends are aborted and remaining payloads are dropped. Defaults
+// to 10s. Non-positive values are ignored.
+func WithCloseTimeout(timeout time.Duration) Option {
+	return func(cfg *config) error {
+		if timeout > 0 {
+			cfg.closeTimeout = timeout
+		}
+		return nil
+	}
+}
+
+// WithMaxTextFieldChars sets the per-field cap (in bytes of UTF-8 text)
+// applied to event input/output, event property and attachment values, and
+// serialized tool span content BEFORE serialization, so oversized payloads
+// cost the cap — not the payload — on the calling goroutine. Truncated fields end with "...[truncated by
+// raindrop]" and never exceed the cap, marker included. Defaults to 1000000.
+// Non-positive values are ignored.
+func WithMaxTextFieldChars(limit int) Option {
+	return func(cfg *config) error {
+		if limit > 0 {
+			cfg.maxTextFieldChars = limit
 		}
 		return nil
 	}
