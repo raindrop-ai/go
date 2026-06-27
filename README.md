@@ -235,6 +235,7 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 
 - `WithWriteKey(string)`: Sets the Raindrop write key. When empty and no local Workshop URL resolves, the client becomes a no-op.
 - `WithEndpoint(string)`: Overrides the base API endpoint. Defaults to `https://api.raindrop.ai/v1/`.
+- `WithProjectID(string)`: Scopes telemetry to a Raindrop project by attaching the `X-Raindrop-Project-Id` header to every outbound request. The value is trimmed and validated against `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`. When unset, no header is sent and the backend routes events to the org's default project; an invalid value is ignored with a logged warning (no header is sent) so a misconfiguration never breaks ingestion.
 - `WithLocalWorkshopURL(string)`: Pins the local Workshop daemon URL, suppressing env vars and the auto-detect probe. Pass an empty string to revert to inherit-from-env behavior.
 - `WithDisableLocalWorkshop()`: Opts out of the local mirror entirely, even if `RAINDROP_LOCAL_DEBUGGER` / `RAINDROP_WORKSHOP` is set or a daemon is listening on the default port.
 - `WithDebug(bool)`: Enables debug logging.
@@ -249,6 +250,27 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - `WithMaxTextFieldChars(int)`: Sets the per-field byte cap applied to event input/output, event property and attachment values, and serialized tool span content before serialization. Defaults to `1000000`. Non-positive values are ignored.
 - `WithCloseTimeout(time.Duration)`: Sets the hard deadline for `Close()`'s final flush; once it passes, in-flight sends are aborted and remaining payloads are dropped. Defaults to `10s`. Non-positive values are ignored.
 - `WithLogger(*slog.Logger)`: Uses a custom structured logger.
+
+## Routing To A Project
+
+By default, telemetry lands in your org's `default` project. Pass
+`WithProjectID` to route every event, signal, identify call, and trace to a
+named project instead:
+
+```go
+client, err := raindrop.New(
+	raindrop.WithWriteKey("rk_..."),
+	raindrop.WithProjectID("checkout-bot"),
+)
+```
+
+When set to a valid slug, the `X-Raindrop-Project-Id` header is attached to
+every outbound request (including the local Workshop mirror). When unset, no
+header is sent and the backend falls back to the default project, so existing
+callers are unaffected. The slug is trimmed and validated against
+`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`; an invalid value is ignored with a
+logged warning and no header is sent, so a misconfigured project ID can never
+break telemetry shipping.
 
 ## Local Workshop Mirror
 
@@ -272,6 +294,7 @@ The local POST uses a 2s timeout, no retries, and errors are logged at `debug` l
 - Signal payloads go to `/signals/track`.
 - User identify payloads go to `/users/identify`.
 - Traces are sent as OTLP JSON to `/traces`.
+- When `WithProjectID` is set to a valid slug, every outbound request carries the `X-Raindrop-Project-Id` header; otherwise the header is omitted.
 - `Begin()`/`Finish()` is the recommended flow for new code.
 - `ResumeInteraction()` is only for recovering an active interaction handle in the same process.
 - Empty `writeKey` with no local Workshop URL resolved disables all shipping without raising errors.

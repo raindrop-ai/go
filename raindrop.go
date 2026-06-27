@@ -56,6 +56,7 @@ func New(opts ...Option) (*Client, error) {
 
 	cfg.writeKey = strings.TrimSpace(cfg.writeKey)
 	cfg.endpoint = formatEndpoint(cfg.endpoint)
+	cfg.projectID = normalizeProjectID(cfg.projectID, cfg.logger)
 	resolvedLocal := ResolveLocalWorkshopURL(cfg.localWorkshop, cfg.autoDetectLocal)
 
 	client := &Client{
