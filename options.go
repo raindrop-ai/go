@@ -12,6 +12,7 @@ type Option func(*config) error
 type config struct {
 	writeKey             string
 	endpoint             string
+	projectID            string
 	localWorkshop        LocalWorkshopConfig
 	autoDetectLocal      bool
 	debug                bool
@@ -65,6 +66,20 @@ func WithWriteKey(writeKey string) Option {
 func WithEndpoint(endpoint string) Option {
 	return func(cfg *config) error {
 		cfg.endpoint = formatEndpoint(endpoint)
+		return nil
+	}
+}
+
+// WithProjectID scopes all telemetry to a Raindrop project. When set to a
+// valid slug, every outbound request carries the X-Raindrop-Project-Id
+// header so the ingest boundary routes events to the named project; when
+// unset, no header is sent and the backend falls back to the org's default
+// project (fully backward compatible). The value is trimmed and validated
+// against ^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$ at New(); an invalid value
+// is ignored with a warning rather than risking an ingest-time rejection.
+func WithProjectID(projectID string) Option {
+	return func(cfg *config) error {
+		cfg.projectID = projectID
 		return nil
 	}
 }

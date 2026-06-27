@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,12 +27,41 @@ const (
 	// maxRetryAfterDelay caps how long a server-provided Retry-After header
 	// can delay the next attempt.
 	maxRetryAfterDelay = 30 * time.Second
+
+	// projectIDHeader routes telemetry to a specific Raindrop project when set.
+	projectIDHeader = "X-Raindrop-Project-Id"
 )
+
+// projectIDSlugPattern bounds a project_id to a DNS-label-style slug.
+var projectIDSlugPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// normalizeProjectID trims and validates a configured project_id. An empty or
+// whitespace-only value yields "" (no header is sent). An invalid value is
+// dropped with a warning rather than risking an ingest-time HTTP 400, so a
+// misconfigured project_id can never break telemetry shipping.
+func normalizeProjectID(raw string, logger *slog.Logger) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if !projectIDSlugPattern.MatchString(trimmed) {
+		if logger != nil {
+			logger.Warn(
+				"raindrop: ignoring invalid project_id; no X-Raindrop-Project-Id header will be sent",
+				"project_id", trimmed,
+				"pattern", projectIDSlugPattern.String(),
+			)
+		}
+		return ""
+	}
+	return trimmed
+}
 
 type retryingHTTPClient struct {
 	baseURL        string
 	localBaseURL   string
 	writeKey       string
+	projectID      string
 	client         *http.Client
 	localClient    *http.Client
 	debug          bool
@@ -67,6 +97,7 @@ func newRetryingHTTPClient(cfg config, localBaseURL string) *retryingHTTPClient 
 		baseURL:        cfg.endpoint,
 		localBaseURL:   localBaseURL,
 		writeKey:       cfg.writeKey,
+		projectID:      cfg.projectID,
 		client:         cfg.httpClient,
 		localClient:    localClient,
 		debug:          cfg.debug,
@@ -142,6 +173,7 @@ func (c *retryingHTTPClient) postOnce(ctx context.Context, url string, payload [
 	}
 	req.Header.Set("Authorization", "Bearer "+c.writeKey)
 	req.Header.Set("Content-Type", "application/json")
+	c.setProjectIDHeader(req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -207,6 +239,7 @@ func (c *retryingHTTPClient) postLocalMirror(ctx context.Context, path string, p
 		req.Header.Set("Authorization", "Bearer "+c.writeKey)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setProjectIDHeader(req)
 	resp, err := c.localClient.Do(req)
 	if err != nil {
 		c.debugMirror("local mirror POST failed", "error", err, "url", url)
@@ -223,6 +256,15 @@ func (c *retryingHTTPClient) debugMirror(msg string, args ...any) {
 		return
 	}
 	c.logger.Debug(msg, args...)
+}
+
+// setProjectIDHeader attaches the project routing header when a project_id is
+// set. Values are trimmed and validated once at New(), so projectID is empty
+// here for blank or invalid input and no header is sent.
+func (c *retryingHTTPClient) setProjectIDHeader(req *http.Request) {
+	if c.projectID != "" {
+		req.Header.Set(projectIDHeader, c.projectID)
+	}
 }
 
 func (c *retryingHTTPClient) retryDelay(retryNumber int, previous error) time.Duration {
