@@ -8,3 +8,4 @@ track-batch-array@fault: missing_feature  # SDK never POSTs events/track and doe
 track-nested-properties@fault: missing_feature  # SDK never POSTs events/track: track ships via events/track_partial as a single-object body, not the ratified array batch (DEV-1149)
 track-plain-single@fault: missing_feature  # SDK never POSTs events/track: track ships via events/track_partial as a single-object body, not the ratified array batch (DEV-1149)
 track-single@fault: missing_feature  # SDK never POSTs events/track: track_ai ships via events/track_partial as a single-object body, not the ratified array batch (DEV-1149)
+wrap-retry-429-partial-hot-path@fault: bug  # Class 1 violation on the real route: TrackAI sleeps through Retry-After on the caller goroutine (step 1001ms vs max_ms 100) before the retry ships (DEV-1148)

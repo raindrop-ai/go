@@ -53,10 +53,21 @@ var (
 	capabilities = []string{
 		"events.track",
 		"events.track_ai",
+		// Factually true delivery mode: TrackEvent/TrackAI ship begin-style
+		// to events/track_partial (DEV-1149) — declaring it runs the
+		// wrap-*-partial scenarios against the route this SDK actually uses.
+		"events.track_ai_partial",
 		"events.track_partial",
 		"identify",
 	}
-	notApplicable = []string{}
+	notApplicable = []string{"wrapper.capture"}
+	// A not_applicable claim must argue "not fixable" (README policy).
+	notApplicableReasons = map[string]string{
+		"wrapper.capture": "core SDK driven by direct calls; a framework capture path cannot exist by design",
+	}
+	// traces.otlp is deliberately NOT declared and NOT not_applicable: the SDK
+	// ships OTLP spans (otlp.go/traces.go) but the harness cannot drive trace
+	// emission yet — a visible gap tracked as DEV-1153.
 )
 
 // unsupportedSteps carry a capability the driver does not advertise. Reaching
@@ -64,12 +75,13 @@ var (
 var unsupportedSteps = map[string]bool{"signal": true}
 
 type describeOutput struct {
-	SDKName       string   `json:"sdk_name"`
-	SDKVersion    string   `json:"sdk_version"`
-	DriverVersion string   `json:"driver_version"`
-	Protocol      int      `json:"protocol"`
-	Capabilities  []string `json:"capabilities"`
-	NotApplicable []string `json:"not_applicable"`
+	SDKName             string            `json:"sdk_name"`
+	SDKVersion          string            `json:"sdk_version"`
+	DriverVersion       string            `json:"driver_version"`
+	Protocol            int               `json:"protocol"`
+	Capabilities        []string          `json:"capabilities"`
+	NotApplicable       []string          `json:"not_applicable"`
+	NotApplicableReason map[string]string `json:"not_applicable_reasons"`
 }
 
 type timingLine struct {
@@ -447,12 +459,13 @@ func eventFields(args map[string]any) (eventArgs, error) {
 
 func describe() error {
 	return json.NewEncoder(os.Stdout).Encode(describeOutput{
-		SDKName:       sdkName,
-		SDKVersion:    raindrop.Version,
-		DriverVersion: driverVersion,
-		Protocol:      protocolMajor,
-		Capabilities:  capabilities,
-		NotApplicable: notApplicable,
+		SDKName:             sdkName,
+		SDKVersion:          raindrop.Version,
+		DriverVersion:       driverVersion,
+		Protocol:            protocolMajor,
+		Capabilities:        capabilities,
+		NotApplicable:       notApplicable,
+		NotApplicableReason: notApplicableReasons,
 	})
 }
 
