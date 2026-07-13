@@ -238,13 +238,19 @@ func (d *driver) stepInit() error {
 	if d.client != nil {
 		return fmt.Errorf("init: client already constructed")
 	}
+	writeKey := strings.TrimSpace(os.Getenv("RAINDROP_WRITE_KEY"))
+	if writeKey == "" {
+		// An empty write key + WithDisableLocalWorkshop() yields a disabled
+		// client: every step "succeeds" while nothing ships. Hard config error.
+		return errors.New("init: RAINDROP_WRITE_KEY is required: an empty key builds a disabled client and the run becomes a silent no-op")
+	}
 	opts := []raindrop.Option{
-		raindrop.WithWriteKey(os.Getenv("RAINDROP_WRITE_KEY")),
+		raindrop.WithWriteKey(writeKey),
 		// The harness measures the SDK↔sink exchange alone; a locally running
 		// Workshop daemon must not be probed or dual-shipped to.
 		raindrop.WithDisableLocalWorkshop(),
 	}
-	sink := strings.TrimRight(os.Getenv("RAINDROP_SINK_URL"), "/")
+	sink := strings.TrimRight(strings.TrimSpace(os.Getenv("RAINDROP_SINK_URL")), "/")
 	if sink == "" {
 		// A missing sink must never fall through to the SDK's production
 		// default: a conformance run pointed at prod would ship test traffic
