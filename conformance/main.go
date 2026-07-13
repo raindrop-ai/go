@@ -24,6 +24,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -231,9 +232,14 @@ func (d *driver) stepInit() error {
 		// Workshop daemon must not be probed or dual-shipped to.
 		raindrop.WithDisableLocalWorkshop(),
 	}
-	if sink := strings.TrimRight(os.Getenv("RAINDROP_SINK_URL"), "/"); sink != "" {
-		opts = append(opts, raindrop.WithEndpoint(sink+"/v1/"))
+	sink := strings.TrimRight(os.Getenv("RAINDROP_SINK_URL"), "/")
+	if sink == "" {
+		// A missing sink must never fall through to the SDK's production
+		// default: a conformance run pointed at prod would ship test traffic
+		// with a real-looking bearer key. Hard config error instead.
+		return errors.New("init: RAINDROP_SINK_URL is required: refusing to run against the SDK's default production endpoint")
 	}
+	opts = append(opts, raindrop.WithEndpoint(sink+"/v1/"))
 	if projectID := os.Getenv("RAINDROP_PROJECT_ID"); projectID != "" {
 		opts = append(opts, raindrop.WithProjectID(projectID))
 	}
