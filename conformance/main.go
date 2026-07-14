@@ -42,11 +42,6 @@ const (
 
 // Canonical capability keys (harness capabilities.yaml) this SDK supports.
 //
-// Omitted deliberately:
-//   - `signal` — signals are not exercised in the conformance MVP (per
-//     DEV-1130/DEV-1144 the corpus defers signal scenarios pending DEV-1139),
-//     so the `signal` step is reported unsupported rather than implemented.
-//
 // An omitted key is neither supported nor structurally not-applicable, so the
 // runner skips scenarios that require it.
 var (
@@ -59,6 +54,10 @@ var (
 		"events.track_ai_partial",
 		"events.track_partial",
 		"identify",
+		// `signal` maps to the public Client.TrackSignal surface (DEV-1201:
+		// the capability went active once signal UUIDs populate on Query API
+		// reads; signal scenarios are experimental until promoted).
+		"signal",
 	}
 	notApplicable = []string{"wrapper.capture"}
 	// A not_applicable claim must argue "not fixable" (README policy).
@@ -71,8 +70,9 @@ var (
 )
 
 // unsupportedSteps carry a capability the driver does not advertise. Reaching
-// one is the exit-3 "unsupported" path.
-var unsupportedSteps = map[string]bool{"signal": true}
+// one is the exit-3 "unsupported" path. (Currently empty: every step in the
+// v1 vocabulary that this SDK can express is mapped.)
+var unsupportedSteps = map[string]bool{}
 
 type describeOutput struct {
 	SDKName             string            `json:"sdk_name"`
@@ -223,6 +223,8 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 		return d.stepFinish(args)
 	case "identify":
 		return d.stepIdentify(ctx, args)
+	case "signal":
+		return d.stepSignal(ctx, args)
 	case "flush":
 		return d.stepFlush(ctx)
 	case "close":
@@ -348,6 +350,65 @@ func (d *driver) stepIdentify(ctx context.Context, args map[string]any) error {
 		return fmt.Errorf("identify: missing required arg \"traits\"")
 	}
 	return client.Identify(ctx, raindrop.User{UserID: userID, Traits: traits})
+}
+
+func (d *driver) stepSignal(ctx context.Context, args map[string]any) error {
+	client, err := d.requireClient()
+	if err != nil {
+		return err
+	}
+	// The harness `signal` step's event_id/name land on signals/track as
+	// event_id/signal_name (signal_type defaults server-convention "default")
+	// via the public Client.TrackSignal surface.
+	eventID, err := stringArg(args, "event_id")
+	if err != nil {
+		return err
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return err
+	}
+	if eventID == "" || name == "" {
+		return fmt.Errorf("signal: missing required arg %q", map[bool]string{true: "event_id", false: "name"}[eventID == ""])
+	}
+	sig := raindrop.Signal{EventID: eventID, Name: name}
+	if v, err := stringArg(args, "signal_type"); err != nil {
+		return err
+	} else if v != "" {
+		sig.Type = v
+	}
+	if v, err := stringArg(args, "sentiment"); err != nil {
+		return err
+	} else if v != "" {
+		sig.Sentiment = v
+	}
+	if v, err := stringArg(args, "timestamp"); err != nil {
+		return err
+	} else if v != "" {
+		ts, perr := time.Parse(time.RFC3339, v)
+		if perr != nil {
+			return fmt.Errorf("signal: arg \"timestamp\" is not RFC3339: %w", perr)
+		}
+		sig.Timestamp = ts
+	}
+	if props, err := objectArg(args, "properties"); err != nil {
+		return err
+	} else if props != nil {
+		sig.Properties = props
+	}
+	if v, err := stringArg(args, "attachment_id"); err != nil {
+		return err
+	} else if v != "" {
+		sig.AttachmentID = v
+	}
+	// The public Signal struct carries no comment/after fields — refuse
+	// loudly rather than silently drop (fleet non-negotiable).
+	for _, unmappable := range []string{"comment", "after"} {
+		if _, present := args[unmappable]; present {
+			return fmt.Errorf("signal: arg %q is not mappable onto the public TrackSignal surface", unmappable)
+		}
+	}
+	return client.TrackSignal(ctx, sig)
 }
 
 // -- partial (begin/patch/finish) lifecycle ---------------------------------
