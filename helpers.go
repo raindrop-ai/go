@@ -34,6 +34,17 @@ func mergeMaps(base map[string]any, overlay map[string]any) map[string]any {
 	return merged
 }
 
+func cloneStringMap(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
 func cloneAttachments(src []Attachment) []Attachment {
 	if len(src) == 0 {
 		return nil

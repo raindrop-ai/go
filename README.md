@@ -153,6 +153,28 @@ _ = client.TrackEvent(ctx, raindrop.Event{
 })
 ```
 
+### Feature Flags
+
+Attach the feature-flag variants active when an event happened with the
+optional `FeatureFlags` (a `map[string]string`). It is available on the
+`Event`, `AIEvent`, `BeginOptions`, `PatchOptions`, and `FinishOptions`
+surfaces (and via `interaction.SetFeatureFlags`), and serializes to the
+top-level `feature_flags` object on the wire. Omit it and no key is sent.
+
+```go
+_ = client.TrackAI(ctx, raindrop.AIEvent{
+	UserID: "user-123",
+	Event:  "chat_message",
+	Input:  "How do I enable reasoning?",
+	Output: "Toggle it in Settings.",
+	Model:  "gpt-4o",
+	FeatureFlags: map[string]string{
+		"prompt-version": "v2",
+		"cohort":         "beta",
+	},
+})
+```
+
 ## Tool Spans
 
 ```go

@@ -7,16 +7,17 @@ import (
 )
 
 type eventPatch struct {
-	EventName   string
-	UserID      string
-	ConvoID     string
-	Input       string
-	Output      string
-	Model       string
-	Properties  map[string]any
-	Attachments []Attachment
-	IsPending   *bool
-	Timestamp   time.Time
+	EventName    string
+	UserID       string
+	ConvoID      string
+	Input        string
+	Output       string
+	Model        string
+	Properties   map[string]any
+	Attachments  []Attachment
+	FeatureFlags map[string]string
+	IsPending    *bool
+	Timestamp    time.Time
 }
 
 type stickyEventData struct {
@@ -225,6 +226,15 @@ func mergeEventPatches(target, source eventPatch) eventPatch {
 	if len(source.Attachments) > 0 {
 		out.Attachments = append(cloneAttachments(target.Attachments), source.Attachments...)
 	}
+	if target.FeatureFlags != nil || source.FeatureFlags != nil {
+		out.FeatureFlags = cloneStringMap(target.FeatureFlags)
+		if out.FeatureFlags == nil {
+			out.FeatureFlags = make(map[string]string, len(source.FeatureFlags))
+		}
+		for key, value := range source.FeatureFlags {
+			out.FeatureFlags[key] = value
+		}
+	}
 	return out
 }
 
@@ -247,14 +257,15 @@ func mergeStickyEventData(existing stickyEventData, patch eventPatch) stickyEven
 }
 
 type trackPartialPayload struct {
-	EventID     string         `json:"event_id"`
-	UserID      string         `json:"user_id"`
-	Event       string         `json:"event"`
-	Timestamp   string         `json:"timestamp"`
-	AIData      *aiDataPayload `json:"ai_data,omitempty"`
-	Properties  map[string]any `json:"properties"`
-	Attachments []Attachment   `json:"attachments"`
-	IsPending   bool           `json:"is_pending"`
+	EventID      string            `json:"event_id"`
+	UserID       string            `json:"user_id"`
+	Event        string            `json:"event"`
+	Timestamp    string            `json:"timestamp"`
+	AIData       *aiDataPayload    `json:"ai_data,omitempty"`
+	Properties   map[string]any    `json:"properties"`
+	Attachments  []Attachment      `json:"attachments"`
+	FeatureFlags map[string]string `json:"feature_flags,omitempty"`
+	IsPending    bool              `json:"is_pending"`
 }
 
 type aiDataPayload struct {
@@ -317,6 +328,10 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 		Properties:  properties,
 		Attachments: attachments,
 		IsPending:   isPending,
+	}
+
+	if len(patch.FeatureFlags) > 0 {
+		payload.FeatureFlags = cloneStringMap(patch.FeatureFlags)
 	}
 
 	if patch.Input != "" || patch.Output != "" || patch.Model != "" || convoID != "" {

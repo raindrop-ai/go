@@ -14,58 +14,63 @@ type Attachment struct {
 }
 
 type Event struct {
-	EventID     string
-	UserID      string
-	Event       string
-	Timestamp   time.Time
-	Properties  map[string]any
-	Attachments []Attachment
+	EventID      string
+	UserID       string
+	Event        string
+	Timestamp    time.Time
+	Properties   map[string]any
+	Attachments  []Attachment
+	FeatureFlags map[string]string
 }
 
 type AIEvent struct {
-	EventID     string
-	UserID      string
-	Event       string
-	Timestamp   time.Time
-	Input       string
-	Output      string
-	Model       string
-	ConvoID     string
-	Properties  map[string]any
-	Attachments []Attachment
+	EventID      string
+	UserID       string
+	Event        string
+	Timestamp    time.Time
+	Input        string
+	Output       string
+	Model        string
+	ConvoID      string
+	Properties   map[string]any
+	Attachments  []Attachment
+	FeatureFlags map[string]string
 }
 
 type BeginOptions struct {
-	EventID     string
-	UserID      string
-	Event       string
-	Timestamp   time.Time
-	Input       string
-	Model       string
-	ConvoID     string
-	Properties  map[string]any
-	Attachments []Attachment
+	EventID      string
+	UserID       string
+	Event        string
+	Timestamp    time.Time
+	Input        string
+	Model        string
+	ConvoID      string
+	Properties   map[string]any
+	Attachments  []Attachment
+	FeatureFlags map[string]string
 }
 
 type PatchOptions struct {
-	UserID      string
-	Event       string
-	Timestamp   time.Time
-	Input       string
-	Output      string
-	Model       string
-	ConvoID     string
-	Properties  map[string]any
-	Attachments []Attachment
-	IsPending   *bool
+	UserID       string
+	Event        string
+	Timestamp    time.Time
+	Input        string
+	Output       string
+	Model        string
+	ConvoID      string
+	Properties   map[string]any
+	Attachments  []Attachment
+	FeatureFlags map[string]string
+	IsPending    *bool
 }
 
 type FinishOptions struct {
-	Timestamp   time.Time
-	Output      string
-	Model       string
-	Properties  map[string]any
-	Attachments []Attachment
+	Timestamp    time.Time
+	Output       string
+	Model        string
+	Properties   map[string]any
+	Attachments  []Attachment
+	FeatureFlags map[string]string
 }
 
 type Interaction struct {
@@ -85,12 +90,13 @@ func (c *Client) TrackEvent(ctx context.Context, event Event) error {
 	}
 	done := false
 	return c.Patch(ctx, eventID, PatchOptions{
-		UserID:      event.UserID,
-		Event:       eventNameOrDefault(event.Event),
-		Timestamp:   event.Timestamp,
-		Properties:  cloneMap(event.Properties),
-		Attachments: cloneAttachments(event.Attachments),
-		IsPending:   &done,
+		UserID:       event.UserID,
+		Event:        eventNameOrDefault(event.Event),
+		Timestamp:    event.Timestamp,
+		Properties:   cloneMap(event.Properties),
+		Attachments:  cloneAttachments(event.Attachments),
+		FeatureFlags: cloneStringMap(event.FeatureFlags),
+		IsPending:    &done,
 	})
 }
 
@@ -105,16 +111,17 @@ func (c *Client) TrackAI(ctx context.Context, event AIEvent) error {
 	}
 	done := false
 	return c.Patch(ctx, eventID, PatchOptions{
-		UserID:      event.UserID,
-		Event:       eventNameOrDefault(event.Event),
-		Timestamp:   event.Timestamp,
-		Input:       event.Input,
-		Output:      event.Output,
-		Model:       event.Model,
-		ConvoID:     event.ConvoID,
-		Properties:  cloneMap(event.Properties),
-		Attachments: cloneAttachments(event.Attachments),
-		IsPending:   &done,
+		UserID:       event.UserID,
+		Event:        eventNameOrDefault(event.Event),
+		Timestamp:    event.Timestamp,
+		Input:        event.Input,
+		Output:       event.Output,
+		Model:        event.Model,
+		ConvoID:      event.ConvoID,
+		Properties:   cloneMap(event.Properties),
+		Attachments:  cloneAttachments(event.Attachments),
+		FeatureFlags: cloneStringMap(event.FeatureFlags),
+		IsPending:    &done,
 	})
 }
 
@@ -133,15 +140,16 @@ func (c *Client) Begin(ctx context.Context, opts BeginOptions) *Interaction {
 	}
 	pending := true
 	_ = c.Patch(ctx, eventID, PatchOptions{
-		UserID:      opts.UserID,
-		Event:       eventNameOrDefault(opts.Event),
-		Timestamp:   opts.Timestamp,
-		Input:       opts.Input,
-		Model:       opts.Model,
-		ConvoID:     opts.ConvoID,
-		Properties:  cloneMap(opts.Properties),
-		Attachments: cloneAttachments(opts.Attachments),
-		IsPending:   &pending,
+		UserID:       opts.UserID,
+		Event:        eventNameOrDefault(opts.Event),
+		Timestamp:    opts.Timestamp,
+		Input:        opts.Input,
+		Model:        opts.Model,
+		ConvoID:      opts.ConvoID,
+		Properties:   cloneMap(opts.Properties),
+		Attachments:  cloneAttachments(opts.Attachments),
+		FeatureFlags: cloneStringMap(opts.FeatureFlags),
+		IsPending:    &pending,
 	})
 	interaction := &Interaction{client: c, ctx: ctx, eventID: eventID}
 	if eventID != "" {
@@ -182,28 +190,30 @@ func (c *Client) Patch(ctx context.Context, eventID string, opts PatchOptions) e
 	// at full size: the cost on the caller stays proportional to the cap.
 	limit := c.textFieldLimit()
 	return c.events.Patch(ctx, eventID, eventPatch{
-		EventName:   opts.Event,
-		UserID:      opts.UserID,
-		Timestamp:   opts.Timestamp,
-		Input:       capText(opts.Input, limit),
-		Output:      capText(opts.Output, limit),
-		Model:       opts.Model,
-		ConvoID:     opts.ConvoID,
-		Properties:  capProperties(opts.Properties, limit),
-		Attachments: capAttachments(opts.Attachments, limit),
-		IsPending:   opts.IsPending,
+		EventName:    opts.Event,
+		UserID:       opts.UserID,
+		Timestamp:    opts.Timestamp,
+		Input:        capText(opts.Input, limit),
+		Output:       capText(opts.Output, limit),
+		Model:        opts.Model,
+		ConvoID:      opts.ConvoID,
+		Properties:   capProperties(opts.Properties, limit),
+		Attachments:  capAttachments(opts.Attachments, limit),
+		FeatureFlags: cloneStringMap(opts.FeatureFlags),
+		IsPending:    opts.IsPending,
 	})
 }
 
 func (c *Client) Finish(ctx context.Context, eventID string, opts FinishOptions) error {
 	done := false
 	return c.Patch(ctx, eventID, PatchOptions{
-		Timestamp:   opts.Timestamp,
-		Output:      opts.Output,
-		Model:       opts.Model,
-		Properties:  cloneMap(opts.Properties),
-		Attachments: cloneAttachments(opts.Attachments),
-		IsPending:   &done,
+		Timestamp:    opts.Timestamp,
+		Output:       opts.Output,
+		Model:        opts.Model,
+		Properties:   cloneMap(opts.Properties),
+		Attachments:  cloneAttachments(opts.Attachments),
+		FeatureFlags: cloneStringMap(opts.FeatureFlags),
+		IsPending:    &done,
 	})
 }
 
@@ -227,6 +237,10 @@ func (i *Interaction) Patch(opts PatchOptions) error {
 
 func (i *Interaction) SetProperties(properties map[string]any) error {
 	return i.Patch(PatchOptions{Properties: cloneMap(properties)})
+}
+
+func (i *Interaction) SetFeatureFlags(featureFlags map[string]string) error {
+	return i.Patch(PatchOptions{FeatureFlags: cloneStringMap(featureFlags)})
 }
 
 func (i *Interaction) SetProperty(key string, value any) error {
