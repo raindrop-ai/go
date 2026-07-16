@@ -54,6 +54,12 @@ var (
 		"events.track_ai_partial",
 		"events.track_partial",
 		"identify",
+		// `feature_flags` maps to the public FeatureFlags map on the
+		// track/track_ai/begin/patch surfaces (DEV-1214): the SDK ships it as a
+		// top-level `feature_flags` string→string object on its
+		// events/track_partial body, matching dawn's ingest schema and the
+		// raindrop-js core event-shipper wire key.
+		"events.feature_flags",
 		// `signal` maps to the public Client.TrackSignal surface (DEV-1201:
 		// the capability went active once signal UUIDs populate on Query API
 		// reads; signal scenarios are experimental until promoted).
@@ -119,6 +125,30 @@ func stringArg(args map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("arg %q: expected string, got %T", key, v)
 	}
 	return s, nil
+}
+
+// stringMapArg maps a harness object arg whose values are all strings onto a
+// Go map[string]string (the shape of the SDK's public feature-flag surface).
+// A non-string value is refused loudly rather than coerced (fleet
+// non-negotiable: never silently drop or mangle a step arg).
+func stringMapArg(args map[string]any, key string) (map[string]string, error) {
+	v, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("arg %q: expected object, got %T", key, v)
+	}
+	out := make(map[string]string, len(m))
+	for k, raw := range m {
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("arg %q[%q]: expected string value, got %T", key, k, raw)
+		}
+		out[k] = s
+	}
+	return out, nil
 }
 
 func objectArg(args map[string]any, key string) (map[string]any, error) {
@@ -299,12 +329,13 @@ func (d *driver) stepTrack(ctx context.Context, args map[string]any) error {
 		return err
 	}
 	return client.TrackEvent(ctx, raindrop.Event{
-		EventID:     event.eventID,
-		UserID:      event.userID,
-		Event:       event.event,
-		Timestamp:   event.timestamp,
-		Properties:  event.properties,
-		Attachments: event.attachments,
+		EventID:      event.eventID,
+		UserID:       event.userID,
+		Event:        event.event,
+		Timestamp:    event.timestamp,
+		Properties:   event.properties,
+		Attachments:  event.attachments,
+		FeatureFlags: event.featureFlags,
 	})
 }
 
@@ -318,16 +349,17 @@ func (d *driver) stepTrackAI(ctx context.Context, args map[string]any) error {
 		return err
 	}
 	return client.TrackAI(ctx, raindrop.AIEvent{
-		EventID:     event.eventID,
-		UserID:      event.userID,
-		Event:       event.event,
-		Timestamp:   event.timestamp,
-		Input:       event.input,
-		Output:      event.output,
-		Model:       event.model,
-		ConvoID:     event.convoID,
-		Properties:  event.properties,
-		Attachments: event.attachments,
+		EventID:      event.eventID,
+		UserID:       event.userID,
+		Event:        event.event,
+		Timestamp:    event.timestamp,
+		Input:        event.input,
+		Output:       event.output,
+		Model:        event.model,
+		ConvoID:      event.convoID,
+		Properties:   event.properties,
+		Attachments:  event.attachments,
+		FeatureFlags: event.featureFlags,
 	})
 }
 
@@ -426,15 +458,16 @@ func (d *driver) stepBegin(ctx context.Context, args map[string]any) error {
 		return err
 	}
 	d.interaction = client.Begin(ctx, raindrop.BeginOptions{
-		EventID:     event.eventID,
-		UserID:      event.userID,
-		Event:       event.event,
-		Timestamp:   event.timestamp,
-		Input:       event.input,
-		Model:       event.model,
-		ConvoID:     event.convoID,
-		Properties:  event.properties,
-		Attachments: event.attachments,
+		EventID:      event.eventID,
+		UserID:       event.userID,
+		Event:        event.event,
+		Timestamp:    event.timestamp,
+		Input:        event.input,
+		Model:        event.model,
+		ConvoID:      event.convoID,
+		Properties:   event.properties,
+		Attachments:  event.attachments,
+		FeatureFlags: event.featureFlags,
 	})
 	return nil
 }
@@ -448,15 +481,16 @@ func (d *driver) stepPatch(args map[string]any) error {
 		return err
 	}
 	return d.interaction.Patch(raindrop.PatchOptions{
-		UserID:      event.userID,
-		Event:       event.event,
-		Timestamp:   event.timestamp,
-		Input:       event.input,
-		Output:      event.output,
-		Model:       event.model,
-		ConvoID:     event.convoID,
-		Properties:  event.properties,
-		Attachments: event.attachments,
+		UserID:       event.userID,
+		Event:        event.event,
+		Timestamp:    event.timestamp,
+		Input:        event.input,
+		Output:       event.output,
+		Model:        event.model,
+		ConvoID:      event.convoID,
+		Properties:   event.properties,
+		Attachments:  event.attachments,
+		FeatureFlags: event.featureFlags,
 	})
 }
 
@@ -469,11 +503,12 @@ func (d *driver) stepFinish(args map[string]any) error {
 		return err
 	}
 	err = d.interaction.Finish(raindrop.FinishOptions{
-		Timestamp:   event.timestamp,
-		Output:      event.output,
-		Model:       event.model,
-		Properties:  event.properties,
-		Attachments: event.attachments,
+		Timestamp:    event.timestamp,
+		Output:       event.output,
+		Model:        event.model,
+		Properties:   event.properties,
+		Attachments:  event.attachments,
+		FeatureFlags: event.featureFlags,
 	})
 	d.interaction = nil
 	return err
@@ -482,16 +517,17 @@ func (d *driver) stepFinish(args map[string]any) error {
 // eventArgs is the union of the harness's event-shaped step args; each step
 // handler forwards only the fields its SDK call accepts.
 type eventArgs struct {
-	eventID     string
-	userID      string
-	event       string
-	input       string
-	output      string
-	model       string
-	convoID     string
-	timestamp   time.Time
-	properties  map[string]any
-	attachments []raindrop.Attachment
+	eventID      string
+	userID       string
+	event        string
+	input        string
+	output       string
+	model        string
+	convoID      string
+	timestamp    time.Time
+	properties   map[string]any
+	attachments  []raindrop.Attachment
+	featureFlags map[string]string
 }
 
 func eventFields(args map[string]any) (eventArgs, error) {
@@ -517,6 +553,9 @@ func eventFields(args map[string]any) (eventArgs, error) {
 		return out, err
 	}
 	if out.attachments, err = attachmentsArg(args); err != nil {
+		return out, err
+	}
+	if out.featureFlags, err = stringMapArg(args, "feature_flags"); err != nil {
 		return out, err
 	}
 	return out, nil
