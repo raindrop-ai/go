@@ -1,6 +1,7 @@
 package raindrop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -1041,4 +1042,160 @@ func newTestClient(t *testing.T, endpoint string, opts ...Option) *Client {
 		t.Fatalf("new client: %v", err)
 	}
 	return client
+}
+
+func validOTLPPayload() exportTraceServiceRequest {
+	return exportTraceServiceRequest{
+		ResourceSpans: []resourceSpans{{
+			Resource: resource{Attributes: []otlpKeyValue{
+				{Key: "service.name", Value: otlpAnyValue{StringValue: "upstream-llm"}},
+			}},
+			ScopeSpans: []scopeSpans{{
+				Scope: scope{Name: "upstream-llm", Version: "1.0"},
+				Spans: []otlpSpan{{
+					TraceID:           "dGVzdHRyYWNlaWQx",
+					SpanID:            "dGVzdHNwYW4x",
+					Name:              "chat_completion",
+					StartTimeUnixNano: "1000000000",
+					EndTimeUnixNano:   "2000000000",
+				}},
+			}},
+		}},
+	}
+}
+
+func TestOTLPHandlerForwardsValidPayload(t *testing.T) {
+	var received exportTraceServiceRequest
+	var gotRequest atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/traces" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		gotRequest.Store(true)
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &received); err != nil {
+			t.Errorf("unmarshal: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/")
+	defer func() { _ = client.Close() }()
+
+	payload, _ := json.Marshal(validOTLPPayload())
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	client.OTLPHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !gotRequest.Load() {
+		t.Fatal("upstream never received the request")
+	}
+	if len(received.ResourceSpans) != 1 {
+		t.Fatalf("expected 1 resourceSpans, got %d", len(received.ResourceSpans))
+	}
+	// Verify incoming service.name was preserved (overlay wins over defaults)
+	attrs := received.ResourceSpans[0].Resource.Attributes
+	var foundServiceName string
+	for _, attr := range attrs {
+		if attr.Key == "service.name" {
+			foundServiceName = attr.Value.StringValue
+		}
+	}
+	if foundServiceName != "upstream-llm" {
+		t.Fatalf("expected service.name=upstream-llm, got %q", foundServiceName)
+	}
+}
+
+func TestOTLPHandlerRejectsInvalidJSON(t *testing.T) {
+	var gotRequest atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/")
+	defer func() { _ = client.Close() }()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", strings.NewReader("not json"))
+	rec := httptest.NewRecorder()
+	client.OTLPHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	if gotRequest.Load() {
+		t.Fatal("upstream should not have received a request")
+	}
+}
+
+func TestOTLPHandlerRejectsWrongMethod(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not have received a request")
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/")
+	defer func() { _ = client.Close() }()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/traces", nil)
+	rec := httptest.NewRecorder()
+	client.OTLPHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+func TestOTLPHandlerNoopWhenDisabled(t *testing.T) {
+	var gotRequest atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/", WithWriteKey(""))
+	defer func() { _ = client.Close() }()
+
+	payload, _ := json.Marshal(validOTLPPayload())
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	client.OTLPHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if gotRequest.Load() {
+		t.Fatal("upstream should not have received a request when disabled")
+	}
+}
+
+func TestOTLPHandlerEmptyResourceSpans(t *testing.T) {
+	var gotRequest atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/")
+	defer func() { _ = client.Close() }()
+
+	payload, _ := json.Marshal(exportTraceServiceRequest{ResourceSpans: []resourceSpans{}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	client.OTLPHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if gotRequest.Load() {
+		t.Fatal("upstream should not have received a request for empty payload")
+	}
 }
