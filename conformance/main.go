@@ -46,6 +46,8 @@ const (
 // runner skips scenarios that require it.
 var (
 	capabilities = []string{
+		"app_git.environment",
+		"app_git.contextual_auto_detection",
 		"events.track",
 		"events.track_ai",
 		// Factually true delivery mode: TrackEvent/TrackAI ship begin-style
@@ -53,6 +55,7 @@ var (
 		// wrap-*-partial scenarios against the route this SDK actually uses.
 		"events.track_ai_partial",
 		"events.track_partial",
+		"app_git.config",
 		"identify",
 		// `signal` maps to the public Client.TrackSignal surface (DEV-1201:
 		// the capability went active once signal UUIDs populate on Query API
@@ -210,7 +213,7 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 	args = cleanArgs(args)
 	switch name {
 	case "init":
-		return d.stepInit()
+		return d.stepInit(args)
 	case "track":
 		return d.stepTrack(ctx, args)
 	case "track_ai":
@@ -236,7 +239,7 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 
 // -- lifecycle -------------------------------------------------------------
 
-func (d *driver) stepInit() error {
+func (d *driver) stepInit(args map[string]any) error {
 	if d.client != nil {
 		return fmt.Errorf("init: client already constructed")
 	}
@@ -251,6 +254,13 @@ func (d *driver) stepInit() error {
 		// The harness measures the SDK↔sink exchange alone; a locally running
 		// Workshop daemon must not be probed or dual-shipped to.
 		raindrop.WithDisableLocalWorkshop(),
+	}
+	appGitOption, err := appGitArg(args)
+	if err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	if appGitOption != nil {
+		opts = append(opts, appGitOption)
 	}
 	sink := strings.TrimRight(strings.TrimSpace(os.Getenv("RAINDROP_SINK_URL")), "/")
 	if sink == "" {
@@ -269,6 +279,57 @@ func (d *driver) stepInit() error {
 	}
 	d.client = client
 	return nil
+}
+
+func appGitArg(args map[string]any) (raindrop.Option, error) {
+	raw, ok := args["app_git"]
+	if !ok {
+		return nil, nil
+	}
+	if enabled, ok := raw.(bool); ok {
+		if !enabled {
+			return raindrop.WithAppGitDisabled(), nil
+		}
+		return nil, fmt.Errorf("arg \"app_git\": expected false or object, got true")
+	}
+	values, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("arg \"app_git\": expected false or object, got %T", raw)
+	}
+	known := map[string]bool{
+		"commit_sha": true, "commit_dirty": true, "branch": true,
+		"source_directory": true, "detect_branch": true, "auto_detect": true,
+	}
+	for key := range values {
+		if !known[key] {
+			return nil, fmt.Errorf("arg \"app_git\": unknown option %q", key)
+		}
+	}
+	var config raindrop.AppGitOptions
+	var err error
+	if config.CommitSHA, err = stringArg(values, "commit_sha"); err != nil {
+		return nil, err
+	}
+	if config.Branch, err = stringArg(values, "branch"); err != nil {
+		return nil, err
+	}
+	if config.SourceDirectory, err = stringArg(values, "source_directory"); err != nil {
+		return nil, err
+	}
+	for key, destination := range map[string]**bool{
+		"commit_dirty":  &config.CommitDirty,
+		"detect_branch": &config.DetectBranch,
+		"auto_detect":   &config.AutoDetect,
+	} {
+		if value, present := values[key]; present {
+			boolean, ok := value.(bool)
+			if !ok {
+				return nil, fmt.Errorf("arg %q: expected boolean, got %T", key, value)
+			}
+			*destination = &boolean
+		}
+	}
+	return raindrop.WithAppGit(config), nil
 }
 
 func (d *driver) stepFlush(ctx context.Context) error {

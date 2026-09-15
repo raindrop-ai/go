@@ -2,6 +2,7 @@ package raindrop
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -72,6 +73,8 @@ type Interaction struct {
 	client  *Client
 	ctx     context.Context
 	eventID string
+	mu      sync.RWMutex
+	appGit  appGitSnapshot
 }
 
 func (c *Client) TrackEvent(ctx context.Context, event Event) error {
@@ -131,8 +134,9 @@ func (c *Client) Begin(ctx context.Context, opts BeginOptions) *Interaction {
 			eventID = generated
 		}
 	}
+	appGit := appGitWithPropertyOverrides(c.appGitSnapshot(), opts.Properties)
 	pending := true
-	_ = c.Patch(ctx, eventID, PatchOptions{
+	_ = c.patch(ctx, eventID, PatchOptions{
 		UserID:      opts.UserID,
 		Event:       eventNameOrDefault(opts.Event),
 		Timestamp:   opts.Timestamp,
@@ -142,8 +146,8 @@ func (c *Client) Begin(ctx context.Context, opts BeginOptions) *Interaction {
 		Properties:  cloneMap(opts.Properties),
 		Attachments: cloneAttachments(opts.Attachments),
 		IsPending:   &pending,
-	})
-	interaction := &Interaction{client: c, ctx: ctx, eventID: eventID}
+	}, appGit)
+	interaction := &Interaction{client: c, ctx: ctx, eventID: eventID, appGit: appGit}
 	if eventID != "" {
 		c.interactions.Store(eventID, interaction)
 	}
@@ -159,14 +163,23 @@ func (c *Client) ResumeInteraction(eventID string) *Interaction {
 			return typed
 		}
 	}
+	appGit := c.appGitSnapshot()
+	if buffered, ok := c.events.appGitSnapshot(eventID); ok {
+		appGit = buffered
+	}
 	return &Interaction{
 		client:  c,
 		ctx:     context.Background(),
 		eventID: eventID,
+		appGit:  appGit,
 	}
 }
 
 func (c *Client) Patch(ctx context.Context, eventID string, opts PatchOptions) error {
+	return c.patch(ctx, eventID, opts, c.appGitSnapshot())
+}
+
+func (c *Client) patch(ctx context.Context, eventID string, opts PatchOptions, appGit appGitSnapshot) error {
 	if c == nil || !c.enabled {
 		return nil
 	}
@@ -175,6 +188,13 @@ func (c *Client) Patch(ctx context.Context, eventID string, opts PatchOptions) e
 	}
 	if eventID == "" {
 		return nil
+	}
+	// Public Client.Patch/Finish calls targeting an interaction must update the
+	// same effective operation provenance used by Interaction spans.
+	if stored, ok := c.interactions.Load(eventID); ok {
+		if interaction, ok := stored.(*Interaction); ok {
+			appGit = interaction.updateAppGit(opts.Properties)
+		}
 	}
 
 	// Cap text fields BEFORE buffering so multi-MB inputs, outputs, property
@@ -192,6 +212,7 @@ func (c *Client) Patch(ctx context.Context, eventID string, opts PatchOptions) e
 		Properties:  capProperties(opts.Properties, limit),
 		Attachments: capAttachments(opts.Attachments, limit),
 		IsPending:   opts.IsPending,
+		AppGit:      &appGit,
 	})
 }
 
@@ -222,7 +243,8 @@ func (i *Interaction) Patch(opts PatchOptions) error {
 	if i == nil || i.client == nil {
 		return nil
 	}
-	return i.client.Patch(i.ctx, i.eventID, opts)
+	appGit := i.updateAppGit(opts.Properties)
+	return i.client.patch(i.ctx, i.eventID, opts, appGit)
 }
 
 func (i *Interaction) SetProperties(properties map[string]any) error {
@@ -248,11 +270,40 @@ func (i *Interaction) Finish(opts FinishOptions) error {
 	if i == nil || i.client == nil {
 		return nil
 	}
-	err := i.client.Finish(i.ctx, i.eventID, opts)
+	done := false
+	appGit := i.updateAppGit(opts.Properties)
+	err := i.client.patch(i.ctx, i.eventID, PatchOptions{
+		Timestamp:   opts.Timestamp,
+		Output:      opts.Output,
+		Model:       opts.Model,
+		Properties:  cloneMap(opts.Properties),
+		Attachments: cloneAttachments(opts.Attachments),
+		IsPending:   &done,
+	}, appGit)
 	if err == nil && i.eventID != "" {
 		i.client.interactions.Delete(i.eventID)
 	}
 	return err
+}
+
+func (i *Interaction) updateAppGit(properties map[string]any) appGitSnapshot {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.appGit = appGitWithPropertyOverrides(i.appGit, properties)
+	return cloneAppGitSnapshot(i.appGit)
+}
+
+func (i *Interaction) appGitSnapshot() appGitSnapshot {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return cloneAppGitSnapshot(i.appGit)
+}
+
+func (c *Client) appGitSnapshot() appGitSnapshot {
+	if c == nil {
+		return emptyAppGitSnapshot()
+	}
+	return c.appGit.snapshot()
 }
 
 func eventNameOrDefault(name string) string {

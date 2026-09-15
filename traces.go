@@ -35,11 +35,13 @@ type TrackToolOptions struct {
 }
 
 type Span struct {
-	client  *Client
-	ids     spanIDs
-	name    string
-	eventID string
-	start   time.Time
+	client              *Client
+	ids                 spanIDs
+	name                string
+	eventID             string
+	start               time.Time
+	appGit              appGitSnapshot
+	canonicalProperties map[string]struct{}
 
 	mu     sync.Mutex
 	attrs  []Attribute
@@ -227,6 +229,16 @@ func (c *Client) StartSpan(ctx context.Context, opts SpanOptions) *Span {
 	if parent == nil {
 		parent = SpanFromContext(ctx)
 	}
+	appGit := c.appGitSnapshot()
+	if parent == nil && opts.EventID != "" {
+		if eventAppGit, ok := c.events.appGitSnapshot(opts.EventID); ok {
+			appGit = eventAppGit
+		}
+	}
+	if parent != nil {
+		appGit = parent.appGitSnapshot()
+	}
+	appGit = appGitForSpan(appGit, opts.Properties, opts.Attributes, c.textFieldLimit())
 
 	ids, err := createSpanIDs(parent)
 	if err != nil {
@@ -240,12 +252,14 @@ func (c *Client) StartSpan(ctx context.Context, opts SpanOptions) *Span {
 	}
 
 	span := &Span{
-		client:  c,
-		ids:     ids,
-		name:    opts.Name,
-		eventID: opts.EventID,
-		start:   start,
-		attrs:   append(append([]Attribute{}, opts.Attributes...), toolPropertyAttributes(opts.Properties, c.textFieldLimit())...),
+		client:              c,
+		ids:                 ids,
+		name:                opts.Name,
+		eventID:             opts.EventID,
+		start:               start,
+		appGit:              appGit,
+		canonicalProperties: canonicalPropertyKeys(opts.Properties),
+		attrs:               append(append([]Attribute{}, opts.Attributes...), toolPropertyAttributes(opts.Properties, c.textFieldLimit())...),
 	}
 	return span
 }
@@ -283,7 +297,13 @@ func (i *Interaction) StartSpan(opts SpanOptions) *Span {
 	if opts.EventID == "" {
 		opts.EventID = i.eventID
 	}
-	return i.client.StartSpan(i.ctx, opts)
+	span := i.client.StartSpan(i.ctx, opts)
+	if span != nil && opts.Parent == nil && SpanFromContext(i.ctx) == nil {
+		span.mu.Lock()
+		span.appGit = appGitForSpan(i.appGitSnapshot(), opts.Properties, opts.Attributes, i.client.textFieldLimit())
+		span.mu.Unlock()
+	}
+	return span
 }
 
 func (i *Interaction) WithSpan(opts SpanOptions, fn func(context.Context, *Span) error) error {
@@ -322,7 +342,8 @@ func (i *Interaction) StartToolSpan(name string, opts ToolOptions) *ToolSpan {
 		EventID:    i.eventID,
 		Parent:     opts.Parent,
 		StartTime:  opts.StartTime,
-		Attributes: buildToolAttributes(name, opts.Input, nil, 0, properties, i.client.textFieldLimit()),
+		Properties: properties,
+		Attributes: buildToolAttributes(name, opts.Input, nil, 0, nil, i.client.textFieldLimit()),
 	})
 	return &ToolSpan{
 		span:  span,
@@ -375,7 +396,8 @@ func (t *Tracer) TrackTool(opts TrackToolOptions) {
 		Name:       opts.Name,
 		Parent:     opts.Parent,
 		StartTime:  startTime,
-		Attributes: buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, opts.Properties, t.client.textFieldLimit()),
+		Properties: opts.Properties,
+		Attributes: buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, nil, t.client.textFieldLimit()),
 	})
 	if opts.Error != nil {
 		span.SetError(opts.Error)
@@ -434,6 +456,7 @@ func (s *Span) SetAttributes(attrs ...Attribute) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attrs = append(s.attrs, attrs...)
+	s.appGit = appGitForSpan(s.appGit, nil, attrs, s.client.textFieldLimit())
 }
 
 func (s *Span) SetError(err error) {
@@ -461,15 +484,28 @@ func (s *Span) EndAt(endTime time.Time) {
 	}
 	s.ended = true
 
-	attributes := make([]otlpKeyValue, 0, len(s.attrs)+1)
+	attributes := make([]otlpKeyValue, 0, len(s.attrs)+len(s.appGit.attributes)+1)
 	if s.eventID != "" {
 		attributes = append(attributes, otlpKeyValue{
 			Key:   "ai.telemetry.metadata.raindrop.eventId",
 			Value: otlpAnyValue{StringValue: s.eventID},
 		})
 	}
+	explicitCanonical := make(map[string]struct{}, len(s.canonicalProperties)+len(s.attrs))
+	for key := range s.canonicalProperties {
+		explicitCanonical[key] = struct{}{}
+	}
 	for _, attr := range s.attrs {
+		if isAppGitProperty(attr.Key) {
+			explicitCanonical[attr.Key] = struct{}{}
+		}
 		attributes = append(attributes, otlpKeyValue{Key: attr.Key, Value: attr.Value})
+	}
+	for key, value := range s.appGit.attributes {
+		if _, exists := explicitCanonical[key]; exists {
+			continue
+		}
+		attributes = append(attributes, otlpKeyValue{Key: key, Value: value})
 	}
 
 	status := s.status
@@ -489,6 +525,29 @@ func (s *Span) EndAt(endTime time.Time) {
 	s.mu.Unlock()
 
 	s.client.traces.Enqueue(span)
+}
+
+func (s *Span) appGitSnapshot() appGitSnapshot {
+	if s == nil {
+		return emptyAppGitSnapshot()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneAppGitSnapshot(s.appGit)
+}
+
+func canonicalPropertyKeys(properties map[string]any) map[string]struct{} {
+	keys := make(map[string]struct{}, 3)
+	for key := range properties {
+		if isAppGitProperty(key) {
+			keys[key] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func isAppGitProperty(key string) bool {
+	return key == appCommitSHAProperty || key == appCommitDirtyProperty || key == appBranchProperty
 }
 
 func (s *ToolSpan) SetInput(input any) {
@@ -586,10 +645,19 @@ func toolPropertyAttributes(properties map[string]any, limit int) []Attribute {
 	}
 	attrs := make([]Attribute, 0, len(properties))
 	for key, value := range properties {
-		if key == "" || value == nil {
+		if key == "" {
 			continue
 		}
 		attrKey := "traceloop.association.properties." + key
+		if isAppGitProperty(key) {
+			attrKey = key
+			if value == nil {
+				attrs = append(attrs, Attribute{Key: attrKey})
+				continue
+			}
+		} else if value == nil {
+			continue
+		}
 		switch typed := value.(type) {
 		case string:
 			attrs = append(attrs, StringAttr(attrKey, capText(typed, limit)))

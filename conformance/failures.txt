@@ -1,4 +1,5 @@
 ai-fields-nested-not-toplevel@fault: missing_feature  # SDK never POSTs events/track: track_ai ships via events/track_partial as a single-object body, not the ratified array batch (DEV-1149)
+app-git-properties-authoritative@fault: missing_feature  # New strict plain-track scenario exposes the same pre-existing events/track route gap (DEV-1149); raw null/empty Git preservation is separately verified on the public partial path.
 batching-close-drains-without-flush@fault: missing_feature  # SDK never POSTs events/track: the scenario's assertions target the ratified batched route, which the SDK lacks — behavior ships via single-object events/track_partial (DEV-1149)
 batching-double-flush-no-duplicate@fault: missing_feature  # SDK never POSTs events/track: the scenario's assertions target the ratified batched route, which the SDK lacks — behavior ships via single-object events/track_partial (DEV-1149)
 batching-flush-cycle-resets-queue@fault: missing_feature  # SDK never POSTs events/track: the scenario's assertions target the ratified batched route, which the SDK lacks — behavior ships via single-object events/track_partial (DEV-1149)
