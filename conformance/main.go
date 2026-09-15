@@ -55,6 +55,7 @@ var (
 		// wrap-*-partial scenarios against the route this SDK actually uses.
 		"events.track_ai_partial",
 		"events.track_partial",
+		"app_git.config",
 		"identify",
 		// `signal` maps to the public Client.TrackSignal surface (DEV-1201:
 		// the capability went active once signal UUIDs populate on Query API

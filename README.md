@@ -282,6 +282,13 @@ GitHub, GitLab, CircleCI, and Buildkite values likewise require their provider
 marker. Ambiguous unmarked variables such as `GIT_COMMIT` are ignored. The SDK
 never uses its own package revision as the application revision.
 
+An explicit `AppGitOptions.SourceDirectory` or
+`RAINDROP_GIT_SOURCE_DIRECTORY` selects the authoritative application checkout.
+After explicit commit/configuration/environment values, discovery uses only
+that checkout; ambient executable, deployment, and CI identity is ignored. If
+the selected directory cannot provide a commit, automatic identity remains
+unknown rather than falling back to the observer environment.
+
 Use `WithAppGitDisabled()` to opt out. When the client option is omitted,
 `RAINDROP_GIT_AUTO_DETECT=false` disables only automatic build/local/CI
 discovery, while keeping explicit properties, client configuration, and
@@ -294,7 +301,11 @@ The source directory is made absolute when the client is created. Revision and
 status are read independently: a known commit is retained if status is
 unavailable, while dirty and branch remain unknown. A complete status includes
 both tracked changes and untracked files; incomplete or truncated status never
-reports a false clean state.
+reports a false clean state. Git subprocesses receive a copied environment with
+repository selectors such as `GIT_DIR`, `GIT_WORK_TREE`, object/index/common-dir
+overrides, namespaces, and environment-injected Git config removed. This keeps
+the configured application source authoritative without changing the host
+process environment.
 
 ## Routing To A Project
 

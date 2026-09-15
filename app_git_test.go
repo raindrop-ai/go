@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testCommitSHA = "0123456789abcdef0123456789abcdef01234567"
@@ -185,7 +186,7 @@ func TestExplicitEnvironmentSurvivesAutomaticOptOut(t *testing.T) {
 	t.Setenv("RAINDROP_BRANCH", "env-branch")
 	t.Setenv("RAINDROP_GIT_AUTO_DETECT", "false")
 
-	snapshot, discover, _, _ := resolveAppGitConfig(appGitConfig{enabled: true})
+	snapshot, discover, _, _, _ := resolveAppGitConfig(appGitConfig{enabled: true})
 	if discover {
 		t.Fatalf("explicit environment should resolve without discovery")
 	}
@@ -202,7 +203,7 @@ func TestExplicitEnvironmentSurvivesAutomaticOptOut(t *testing.T) {
 
 func TestInvalidExplicitDirtyEnvironmentDoesNotBlockSHAInference(t *testing.T) {
 	t.Setenv("RAINDROP_COMMIT_DIRTY", "not-a-boolean")
-	snapshot, discover, _, _ := resolveAppGitConfig(appGitConfig{enabled: true})
+	snapshot, discover, _, _, _ := resolveAppGitConfig(appGitConfig{enabled: true})
 	if !discover {
 		if _, hasSHA := snapshot.properties[appCommitSHAProperty]; !hasSHA {
 			t.Fatalf("dirty-only environment blocked SHA inference: %#v", snapshot.properties)
@@ -215,7 +216,7 @@ func TestExplicitFieldsMergeByPrecedenceAndControlAutomaticDetection(t *testing.
 	t.Setenv("RAINDROP_BRANCH", "environment-branch")
 	t.Setenv("RAINDROP_GIT_AUTO_DETECT", "false")
 	clientAuto := true
-	snapshot, discover, _, _ := resolveAppGitConfig(appGitConfig{
+	snapshot, discover, _, _, _ := resolveAppGitConfig(appGitConfig{
 		enabled:     true,
 		branch:      "client-branch",
 		autoDetect:  &clientAuto,
@@ -254,7 +255,7 @@ func TestClientAutomaticControlsOverrideEnvironmentDefaults(t *testing.T) {
 	unsetEnvironment(t, "RAINDROP_COMMIT_SHA", "RAINDROP_COMMIT_DIRTY", "RAINDROP_BRANCH")
 	t.Setenv("RAINDROP_GIT_AUTO_DETECT", "false")
 	auto := true
-	snapshot, discover, sourceDirectory, _ := resolveAppGitConfig(appGitConfig{enabled: true, branch: "explicit-branch", autoDetect: &auto})
+	snapshot, discover, sourceDirectory, _, _ := resolveAppGitConfig(appGitConfig{enabled: true, branch: "explicit-branch", autoDetect: &auto})
 	if !discover {
 		if _, hasSHA := snapshot.properties[appCommitSHAProperty]; !hasSHA {
 			t.Fatalf("client auto_detect=true did not override environment false: %#v", snapshot.properties)
@@ -268,7 +269,7 @@ func TestClientAutomaticControlsOverrideEnvironmentDefaults(t *testing.T) {
 
 	t.Setenv("RAINDROP_GIT_AUTO_DETECT", "true")
 	auto = false
-	snapshot, discover, _, _ = resolveAppGitConfig(appGitConfig{enabled: true, autoDetect: &auto})
+	snapshot, discover, _, _, _ = resolveAppGitConfig(appGitConfig{enabled: true, autoDetect: &auto})
 	if discover || len(snapshot.properties) != 0 {
 		t.Fatalf("client auto_detect=false did not override environment true: %#v, discover=%v", snapshot.properties, discover)
 	}
@@ -341,6 +342,192 @@ func TestDiscoverLocalAppGit(t *testing.T) {
 	if _, exists := withoutBranch.properties[appBranchProperty]; exists {
 		t.Fatalf("automatic branch was reported without opt-in: %#v", withoutBranch.properties)
 	}
+}
+
+func TestConfiguredSourceDirectoryWinsOverInheritedGitSelectors(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not installed")
+	}
+	root := t.TempDir()
+	autDirectory := filepath.Join(root, "aut")
+	observerDirectory := filepath.Join(root, "observer")
+	autSHA := createTestRepository(t, git, autDirectory, "aut-branch", "application source\n")
+	observerSHA := createTestRepository(t, git, observerDirectory, "observer-branch", "observer source\n")
+	if autSHA == observerSHA {
+		t.Fatalf("fixture commits unexpectedly match: %s", autSHA)
+	}
+
+	configPath := filepath.Join(root, "injected.gitconfig")
+	if err := os.WriteFile(configPath, []byte("[core]\n\tworktree = "+observerDirectory+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selectors := map[string]string{
+		"GIT_DIR":                          filepath.Join(observerDirectory, ".git"),
+		"GIT_WORK_TREE":                    observerDirectory,
+		"GIT_COMMON_DIR":                   filepath.Join(observerDirectory, ".git"),
+		"GIT_INDEX_FILE":                   filepath.Join(observerDirectory, ".git", "index"),
+		"GIT_OBJECT_DIRECTORY":             filepath.Join(observerDirectory, ".git", "objects"),
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": filepath.Join(observerDirectory, ".git", "objects"),
+		"GIT_NAMESPACE":                    "observer",
+		"GIT_CONFIG":                       configPath,
+		"GIT_CONFIG_GLOBAL":                configPath,
+		"GIT_CONFIG_SYSTEM":                configPath,
+		"GIT_CONFIG_PARAMETERS":            "'core.worktree'='" + observerDirectory + "'",
+		"GIT_CONFIG_COUNT":                 "1",
+		"GIT_CONFIG_KEY_0":                 "core.worktree",
+		"GIT_CONFIG_VALUE_0":               observerDirectory,
+	}
+	for key, value := range selectors {
+		t.Setenv(key, value)
+	}
+
+	snapshot, ok := discoverLocalAppGit(autDirectory, true, os.Environ())
+	if !ok {
+		t.Fatalf("AUT discovery failed with inherited observer selectors")
+	}
+	if got := snapshot.properties[appCommitSHAProperty]; got != autSHA {
+		t.Fatalf("reported observer identity: got %#v, AUT %s, observer %s", got, autSHA, observerSHA)
+	}
+	if got := snapshot.properties[appBranchProperty]; got != "aut-branch" {
+		t.Fatalf("reported observer branch: %#v", got)
+	}
+	for key, value := range selectors {
+		if got := os.Getenv(key); got != value {
+			t.Fatalf("customer process environment %s mutated: got %q, want %q", key, got, value)
+		}
+	}
+}
+
+func TestExplicitSourceDirectoryBeatsAmbientDeploymentAndCI(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not installed")
+	}
+	root := t.TempDir()
+	autDirectory := filepath.Join(root, "aut")
+	observerDirectory := filepath.Join(root, "observer")
+	autSHA := createTestRepository(t, git, autDirectory, "aut-branch", "application source\n")
+	observerSHA := createTestRepository(t, git, observerDirectory, "observer-branch", "observer source\n")
+	unsetEnvironment(t, "RAINDROP_COMMIT_SHA", "RAINDROP_COMMIT_DIRTY", "RAINDROP_BRANCH")
+	t.Setenv("VERCEL", "1")
+	t.Setenv("VERCEL_GIT_COMMIT_SHA", observerSHA)
+	t.Setenv("VERCEL_GIT_COMMIT_REF", "observer-vercel")
+	t.Setenv("GITHUB_ACTIONS", "true")
+	t.Setenv("GITHUB_SHA", observerSHA)
+	t.Setenv("GITHUB_REF_NAME", "observer-ci")
+
+	for _, test := range []struct {
+		name    string
+		options func(*testing.T) []Option
+	}{
+		{
+			name: "public client option",
+			options: func(t *testing.T) []Option {
+				return []Option{WithAppGit(AppGitOptions{SourceDirectory: autDirectory})}
+			},
+		},
+		{
+			name: "Raindrop environment option",
+			options: func(t *testing.T) []Option {
+				t.Setenv("RAINDROP_GIT_SOURCE_DIRECTORY", autDirectory)
+				return []Option{WithAppGit(AppGitOptions{})}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var received trackPartialPayload
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&received)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL+"/", test.options(t)...)
+			defer func() { _ = client.Close() }()
+			deadline := time.Now().Add(2 * time.Second)
+			for client.appGit.snapshot().properties[appCommitSHAProperty] != autSHA && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := client.TrackEvent(context.Background(), Event{EventID: "selected-aut", UserID: "user"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := received.Properties[appCommitSHAProperty]; got != autSHA {
+				t.Fatalf("selected AUT commit = %#v, observer = %s", got, observerSHA)
+			}
+		})
+	}
+}
+
+func TestUnavailableExplicitSourceDirectoryDoesNotUseAmbientIdentity(t *testing.T) {
+	unsetEnvironment(t, "RAINDROP_COMMIT_SHA", "RAINDROP_COMMIT_DIRTY", "RAINDROP_BRANCH", "RAINDROP_GIT_SOURCE_DIRECTORY")
+	t.Setenv("VERCEL", "true")
+	t.Setenv("VERCEL_GIT_COMMIT_SHA", testCommitSHA)
+	t.Setenv("GITHUB_ACTIONS", "true")
+	t.Setenv("GITHUB_SHA", testCommitSHA)
+
+	var received trackPartialPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/", WithAppGit(AppGitOptions{SourceDirectory: filepath.Join(t.TempDir(), "missing")}))
+	defer func() { _ = client.Close() }()
+	time.Sleep(gitDiscoveryTimeout + gitCommandWaitDelay + 50*time.Millisecond)
+	if err := client.TrackEvent(context.Background(), Event{EventID: "missing-aut", UserID: "user"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := received.Properties[appCommitSHAProperty]; exists {
+		t.Fatalf("unavailable selected AUT fell back to ambient identity: %#v", received.Properties)
+	}
+}
+
+func TestSanitizedGitEnvironmentPreservesUnrelatedValues(t *testing.T) {
+	environment := []string{
+		"PATH=/usr/bin",
+		"GIT_AUTHOR_NAME=Application",
+		"GIT_DIR=/observer/.git",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.worktree",
+		"GIT_CONFIG_VALUE_0=/observer",
+		"GIT_TERMINAL_PROMPT=1",
+	}
+	clean := sanitizedGitEnvironment(environment)
+	joined := strings.Join(clean, "\n")
+	for _, expected := range []string{"PATH=/usr/bin", "GIT_AUTHOR_NAME=Application", "GIT_TERMINAL_PROMPT=0"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("sanitized environment lost %q: %#v", expected, clean)
+		}
+	}
+	for _, forbidden := range []string{"GIT_DIR=", "GIT_CONFIG_COUNT=", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_TERMINAL_PROMPT=1"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("sanitized environment retained %q: %#v", forbidden, clean)
+		}
+	}
+}
+
+func createTestRepository(t *testing.T, git, directory, branch, contents string) string {
+	t.Helper()
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command(git, append([]string{"-C", directory}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Raindrop", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=Raindrop", "GIT_COMMITTER_EMAIL=test@example.com")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+	run("init", "-b", branch)
+	if err := os.WriteFile(filepath.Join(directory, "app.txt"), []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "app.txt")
+	run("commit", "-m", "initial")
+	return run("rev-parse", "HEAD")
 }
 
 func TestLocalRevisionSurvivesUnavailableStatus(t *testing.T) {

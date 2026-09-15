@@ -88,13 +88,16 @@ func cloneAppGitSnapshot(snapshot appGitSnapshot) appGitSnapshot {
 
 func newAppGitState(cfg appGitConfig) *appGitState {
 	state := &appGitState{}
-	initial, discover, sourceDirectory, detectBranch := resolveAppGitConfig(cfg)
+	initial, discover, sourceDirectory, detectBranch, allowCIFallback := resolveAppGitConfig(cfg)
 	state.store(initial)
 	if !discover {
 		return state
 	}
-	fallback, _ := discoverCIAppGit(detectBranch)
-	commandEnv := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	fallback := emptyAppGitSnapshot()
+	if allowCIFallback {
+		fallback, _ = discoverCIAppGit(detectBranch)
+	}
+	commandEnv := os.Environ()
 
 	// Local Git is intentionally off every telemetry and shutdown path. The
 	// command has a hard deadline, bounded captured output, no shell, and no
@@ -109,13 +112,13 @@ func newAppGitState(cfg appGitConfig) *appGitState {
 	return state
 }
 
-func resolveAppGitConfig(cfg appGitConfig) (appGitSnapshot, bool, string, bool) {
+func resolveAppGitConfig(cfg appGitConfig) (appGitSnapshot, bool, string, bool, bool) {
 	if !cfg.enabled {
-		return emptyAppGitSnapshot(), false, "", false
+		return emptyAppGitSnapshot(), false, "", false, false
 	}
 	explicit := mergedExplicitAppGit(cfg)
 	if _, hasSHA := explicit.properties[appCommitSHAProperty]; hasSHA {
-		return explicit, false, "", false
+		return explicit, false, "", false, false
 	}
 
 	autoDetect := true
@@ -125,7 +128,7 @@ func resolveAppGitConfig(cfg appGitConfig) (appGitSnapshot, bool, string, bool) 
 		autoDetect = false
 	}
 	if !autoDetect {
-		return explicit, false, "", false
+		return explicit, false, "", false, false
 	}
 
 	detectBranch := false
@@ -134,32 +137,29 @@ func resolveAppGitConfig(cfg appGitConfig) (appGitSnapshot, bool, string, bool) 
 	} else if strings.EqualFold(strings.TrimSpace(os.Getenv("RAINDROP_GIT_DETECT_BRANCH")), "true") {
 		detectBranch = true
 	}
-	if snapshot, ok := applicationBuildInfoAppGit(); ok {
-		return mergeAutomaticAndExplicit(snapshot, explicit), false, "", false
-	}
-	if snapshot, ok := applicationDeploymentAppGit(detectBranch); ok {
-		return mergeAutomaticAndExplicit(snapshot, explicit), false, "", false
-	}
 	sourceDirectory := cfg.sourceDirectory
 	if sourceDirectory == "" {
 		sourceDirectory = os.Getenv("RAINDROP_GIT_SOURCE_DIRECTORY")
 	}
-	if sourceDirectory == "" {
-		var err error
-		sourceDirectory, err = os.Getwd()
-		if err != nil {
-			fallback, _ := discoverCIAppGit(detectBranch)
-			return mergeAutomaticAndExplicit(fallback, explicit), false, "", detectBranch
-		}
-	} else {
+	if sourceDirectory != "" {
 		absolute, err := filepath.Abs(sourceDirectory)
 		if err != nil {
-			fallback, _ := discoverCIAppGit(detectBranch)
-			return mergeAutomaticAndExplicit(fallback, explicit), false, "", detectBranch
+			return explicit, false, "", detectBranch, false
 		}
-		sourceDirectory = absolute
+		return explicit, true, absolute, detectBranch, false
 	}
-	return explicit, true, sourceDirectory, detectBranch
+	if snapshot, ok := applicationBuildInfoAppGit(); ok {
+		return mergeAutomaticAndExplicit(snapshot, explicit), false, "", false, false
+	}
+	if snapshot, ok := applicationDeploymentAppGit(detectBranch); ok {
+		return mergeAutomaticAndExplicit(snapshot, explicit), false, "", false, false
+	}
+	sourceDirectory, err := os.Getwd()
+	if err != nil {
+		fallback, _ := discoverCIAppGit(detectBranch)
+		return mergeAutomaticAndExplicit(fallback, explicit), false, "", detectBranch, false
+	}
+	return explicit, true, sourceDirectory, detectBranch, true
 }
 
 func mergedExplicitAppGit(cfg appGitConfig) appGitSnapshot {
@@ -275,7 +275,7 @@ func runGitCommand(directory string, commandEnv []string, args ...string) (strin
 	defer cancel()
 	cmdArgs := append([]string{"-C", directory}, args...)
 	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Env = commandEnv
+	cmd.Env = sanitizedGitEnvironment(commandEnv)
 	cmd.WaitDelay = gitCommandWaitDelay
 	var output limitedBuffer
 	output.limit = gitDiscoveryOutputMax
@@ -285,6 +285,39 @@ func runGitCommand(directory string, commandEnv []string, args ...string) (strin
 		return output.String(), false
 	}
 	return output.String(), true
+}
+
+// sanitizedGitEnvironment returns a copy suitable for Git discovery in the
+// configured application directory. Repository selectors can otherwise make
+// `git -C app` resolve an unrelated observer repository. Environment-based
+// config injection is removed too because injected core.worktree settings can
+// detach status from the repository whose revision was resolved.
+func sanitizedGitEnvironment(environment []string) []string {
+	blocked := map[string]bool{
+		"GIT_DIR":                          true,
+		"GIT_WORK_TREE":                    true,
+		"GIT_COMMON_DIR":                   true,
+		"GIT_INDEX_FILE":                   true,
+		"GIT_OBJECT_DIRECTORY":             true,
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+		"GIT_NAMESPACE":                    true,
+		"GIT_CONFIG":                       true,
+		"GIT_CONFIG_GLOBAL":                true,
+		"GIT_CONFIG_SYSTEM":                true,
+		"GIT_CONFIG_PARAMETERS":            true,
+		"GIT_CONFIG_COUNT":                 true,
+		"GIT_TERMINAL_PROMPT":              true,
+	}
+	clean := make([]string, 0, len(environment)+1)
+	for _, entry := range environment {
+		key, _, found := strings.Cut(entry, "=")
+		normalizedKey := strings.ToUpper(key)
+		if !found || blocked[normalizedKey] || strings.HasPrefix(normalizedKey, "GIT_CONFIG_KEY_") || strings.HasPrefix(normalizedKey, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		clean = append(clean, entry)
+	}
+	return append(clean, "GIT_TERMINAL_PROMPT=0")
 }
 
 func discoverCIAppGit(detectBranch bool) (appGitSnapshot, bool) {
