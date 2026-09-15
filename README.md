@@ -250,6 +250,51 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - `WithMaxTextFieldChars(int)`: Sets the per-field byte cap applied to event input/output, event property and attachment values, and serialized tool span content before serialization. Defaults to `1000000`. Non-positive values are ignored.
 - `WithCloseTimeout(time.Duration)`: Sets the hard deadline for `Close()`'s final flush; once it passes, in-flight sends are aborted and remaining payloads are dropped. Defaults to `10s`. Non-positive values are ignored.
 - `WithLogger(*slog.Logger)`: Uses a custom structured logger.
+- `WithAppGit(AppGitOptions)`: Configures application Git provenance and automatic discovery.
+- `WithAppGitDisabled()`: Disables client-level Git provenance enrichment.
+
+## Application Git provenance
+
+The SDK adds the application executable's Git commit to events and OTLP spans
+when it can identify it safely. It reports `raindrop.app.commit_sha` and, when
+known, `raindrop.app.commit_dirty`. Automatic branch reporting is off by
+default; opt in with `DetectBranch`.
+
+```go
+detectBranch := true
+client, err := raindrop.New(
+	raindrop.WithWriteKey("rk_..."),
+	raindrop.WithAppGit(raindrop.AppGitOptions{
+		DetectBranch: &detectBranch,
+	}),
+)
+```
+
+Explicit `raindrop.app.commit_sha`, `raindrop.app.commit_dirty`, or
+`raindrop.app.branch` values in event properties, span properties, or span
+attributes always win, including empty or otherwise invalid values.
+Configuration values take priority over `RAINDROP_COMMIT_SHA`,
+`RAINDROP_COMMIT_DIRTY`, and
+`RAINDROP_BRANCH`; those explicit sources take priority over Go main-executable
+build information, Vercel deployment metadata, local Git, and provider-marked
+CI metadata, in that order. Vercel is accepted only when `VERCEL=1` or `true`;
+GitHub, GitLab, CircleCI, and Buildkite values likewise require their provider
+marker. Ambiguous unmarked variables such as `GIT_COMMIT` are ignored. The SDK
+never uses its own package revision as the application revision.
+
+Use `WithAppGitDisabled()` to opt out. When the client option is omitted,
+`RAINDROP_GIT_AUTO_DETECT=false` disables only automatic build/local/CI
+discovery, while keeping explicit properties, client configuration, and
+Raindrop environment values. An explicit client `AutoDetect` value takes
+priority over that environment default. Set
+`RAINDROP_GIT_SOURCE_DIRECTORY` to select the application source directory and
+`RAINDROP_GIT_DETECT_BRANCH=true` to opt into automatic branch collection.
+Local Git discovery runs once per client in a bounded background task; telemetry
+The source directory is made absolute when the client is created. Revision and
+status are read independently: a known commit is retained if status is
+unavailable, while dirty and branch remain unknown. A complete status includes
+both tracked changes and untracked files; incomplete or truncated status never
+reports a false clean state.
 
 ## Routing To A Project
 

@@ -17,6 +17,7 @@ type eventPatch struct {
 	Attachments []Attachment
 	IsPending   *bool
 	Timestamp   time.Time
+	AppGit      *appGitSnapshot
 }
 
 type stickyEventData struct {
@@ -24,6 +25,7 @@ type stickyEventData struct {
 	UserID    string
 	ConvoID   string
 	IsPending *bool
+	AppGit    *appGitSnapshot
 }
 
 type eventBuffer struct {
@@ -83,6 +85,18 @@ func (b *eventBuffer) Patch(ctx context.Context, eventID string, patch eventPatc
 	b.mu.Lock()
 	existing := b.buffers[eventID]
 	sticky := b.sticky[eventID]
+	if existing.AppGit == nil && sticky.AppGit != nil {
+		copy := cloneAppGitSnapshot(*sticky.AppGit)
+		existing.AppGit = &copy
+	}
+	base := emptyAppGitSnapshot()
+	if existing.AppGit != nil {
+		base = *existing.AppGit
+	} else if patch.AppGit != nil {
+		base = *patch.AppGit
+	}
+	effective := appGitWithPropertyOverrides(base, patch.Properties)
+	patch.AppGit = &effective
 
 	merged := mergeEventPatches(existing, patch)
 	if merged.IsPending == nil {
@@ -213,6 +227,10 @@ func mergeEventPatches(target, source eventPatch) eventPatch {
 		value := *source.IsPending
 		out.IsPending = &value
 	}
+	if source.AppGit != nil {
+		copy := cloneAppGitSnapshot(*source.AppGit)
+		out.AppGit = &copy
+	}
 	if target.Properties != nil || source.Properties != nil {
 		out.Properties = cloneMap(target.Properties)
 		if out.Properties == nil {
@@ -243,7 +261,23 @@ func mergeStickyEventData(existing stickyEventData, patch eventPatch) stickyEven
 		value := *patch.IsPending
 		out.IsPending = &value
 	}
+	if patch.AppGit != nil {
+		copy := cloneAppGitSnapshot(*patch.AppGit)
+		out.AppGit = &copy
+	}
 	return out
+}
+
+func (b *eventBuffer) appGitSnapshot(eventID string) (appGitSnapshot, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if patch, ok := b.buffers[eventID]; ok && patch.AppGit != nil {
+		return cloneAppGitSnapshot(*patch.AppGit), true
+	}
+	if sticky, ok := b.sticky[eventID]; ok && sticky.AppGit != nil {
+		return cloneAppGitSnapshot(*sticky.AppGit), true
+	}
+	return emptyAppGitSnapshot(), false
 }
 
 type trackPartialPayload struct {
@@ -294,6 +328,13 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 	properties := cloneMap(patch.Properties)
 	if properties == nil {
 		properties = make(map[string]any, 1)
+	}
+	if patch.AppGit != nil {
+		for key, value := range patch.AppGit.properties {
+			if _, exists := properties[key]; !exists {
+				properties[key] = value
+			}
+		}
 	}
 	properties["$context"] = cloneMap(c.contextData)
 

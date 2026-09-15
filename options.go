@@ -31,6 +31,7 @@ type config struct {
 	retryJitterFraction  float64
 	maxTextFieldChars    int
 	closeTimeout         time.Duration
+	appGit               appGitConfig
 }
 
 func defaultConfig() config {
@@ -53,6 +54,43 @@ func defaultConfig() config {
 		retryJitterFraction:  0.2,
 		maxTextFieldChars:    defaultMaxTextFieldChars,
 		closeTimeout:         defaultCloseTimeout,
+		appGit:               appGitConfig{enabled: true},
+	}
+}
+
+// WithAppGit configures application Git provenance. The supplied value is
+// copied into the client configuration; later caller changes do not affect the
+// client. Automatic detection remains enabled unless AutoDetect is false.
+func WithAppGit(options AppGitOptions) Option {
+	return func(cfg *config) error {
+		cfg.appGit = appGitConfig{
+			enabled:         true,
+			commitSHA:       options.CommitSHA,
+			branch:          options.Branch,
+			sourceDirectory: options.SourceDirectory,
+		}
+		if options.CommitDirty != nil {
+			value := *options.CommitDirty
+			cfg.appGit.commitDirty = &value
+		}
+		if options.DetectBranch != nil {
+			value := *options.DetectBranch
+			cfg.appGit.detectBranch = &value
+		}
+		if options.AutoDetect != nil {
+			value := *options.AutoDetect
+			cfg.appGit.autoDetect = &value
+		}
+		return nil
+	}
+}
+
+// WithAppGitDisabled disables all client-level Git provenance enrichment.
+// Explicit canonical properties supplied to events and spans are unchanged.
+func WithAppGitDisabled() Option {
+	return func(cfg *config) error {
+		cfg.appGit = appGitConfig{enabled: false}
+		return nil
 	}
 }
 

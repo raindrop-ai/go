@@ -35,6 +35,7 @@ type Client struct {
 	contextData       map[string]any
 	maxTextFieldChars int
 	closeTimeout      time.Duration
+	appGit            *appGitState
 
 	closeOnce sync.Once
 	closed    bool
@@ -78,6 +79,10 @@ func New(opts ...Option) (*Client, error) {
 			},
 		},
 	}
+	if !client.enabled {
+		cfg.appGit.enabled = false
+	}
+	client.appGit = newAppGitState(cfg.appGit)
 
 	client.transport = newRetryingHTTPClient(cfg, resolvedLocal)
 	client.events = newEventBuffer(client, cfg.partialFlushInterval)
