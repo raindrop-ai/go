@@ -71,7 +71,7 @@ concurrency:
 env:
   # invisible-tools/raindrop-sdk-harness — see "Harness pin" in the header.
   HARNESS_REPO: invisible-tools/raindrop-sdk-harness
-  HARNESS_REF: 2d67f52b1109a5c6bf296e2a4e2c817dbeedde63 # DEV-1673 candidate @ 2026-09-15 (app_git config/payload scenarios + Git reporting coverage)
+  HARNESS_REF: 79ffb42e2ebd3b64e8500f20b8ec8ddce91525ec # DEV-1673 candidate @ 2026-09-15 (Git payload, lifecycle, readback, and blocking regression gate)
   SERVER_URL: http://127.0.0.1:8787
   # Driver binary produced by `go build -o conformance/driver ./conformance`
   # (conformance/ is a stdlib-only package inside this module, so the driver
@@ -155,9 +155,11 @@ jobs:
       - name: Build conformance driver
         if: steps.gate.outputs.run == 'true'
         # conformance/ is a plain package inside this module, so the driver is
-        # compiled against the SDK from this checkout. Output lands at
-        # $DRIVER_BIN. The SDK build itself is never modified.
-        run: go build -o conformance/driver ./conformance
+        # compiled against the SDK from this checkout. Do not embed the harness
+        # binary's VCS revision: that correctly outranks the deployment-source
+        # scenario fixtures. Main-application build info has separate SDK tests.
+        # The SDK build itself is never modified.
+        run: go build -buildvcs=false -o conformance/driver ./conformance
 
       - name: Start fault server
         if: steps.gate.outputs.run == 'true'
@@ -192,6 +194,14 @@ jobs:
           code=${PIPESTATUS[0]}
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
+
+      - name: Require application Git regressions
+        if: always() && steps.gate.outputs.run == 'true'
+        # Keep legacy non-blocking transport checks unchanged; Git regressions
+        # introduced by DEV-1673 must not be hidden by continue-on-error.
+        run: |
+          node --test harness/scripts/check-app-git-results.test.mjs
+          node harness/scripts/check-app-git-results.mjs "$RUNNER_TEMP/report.json"
 
       - name: Stop fault server
         if: always() && steps.gate.outputs.run == 'true'
@@ -300,7 +310,7 @@ jobs:
 
       - name: Build conformance driver
         if: steps.gate.outputs.run == 'true'
-        run: go build -o conformance/driver ./conformance
+        run: go build -buildvcs=false -o conformance/driver ./conformance
 
       - name: Run conformance runner (prod lane)
         id: runner
