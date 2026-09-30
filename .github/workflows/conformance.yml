@@ -71,7 +71,7 @@ concurrency:
 env:
   # invisible-tools/raindrop-sdk-harness — see "Harness pin" in the header.
   HARNESS_REPO: invisible-tools/raindrop-sdk-harness
-  HARNESS_REF: 420a36a61f48bc6cf95308618057b95074a3576b # outage, exit-timing, 4xx/429 and memory scenarios (raindrop-sdk-harness pavel/dev-1788-outage-scenarios)
+  HARNESS_REF: 1c77b9e9f9a54553835da56dc2b01ee37072229f # outage, exit-timing, 4xx/429 and memory scenarios (raindrop-sdk-harness pavel/dev-1788-outage-scenarios)
   SERVER_URL: http://127.0.0.1:8787
   # Driver binary produced by `go build -o conformance/driver ./conformance`
   # (conformance/ is a stdlib-only package inside this module, so the driver

@@ -32,6 +32,7 @@ size-limit-large-text-field@fault: missing_feature  # SDK never POSTs events/tra
 size-limit-oversized-attachment@fault: missing_feature  # SDK never POSTs events/track: the scenario's assertions target the ratified batched route, which the SDK lacks — behavior ships via single-object events/track_partial (DEV-1149)
 size-limit-wide-properties@fault: missing_feature  # SDK never POSTs events/track: the scenario's assertions target the ratified batched route, which the SDK lacks — behavior ships via single-object events/track_partial (DEV-1149)
 traces-400-no-retry@fault: bug  # a trace batch rejected with 400 is re-sent on every flush tick; go#12 drops it (DEV-1802)
+traces-429-exhausted-not-extended@fault: bug  # a trace batch that got 429 is re-sent on every flush tick and delivered after the rate limit (DEV-1788)
 track-ai-custom-event@fault: missing_feature  # SDK never POSTs events/track: track_ai ships via events/track_partial as a single-object body, not the ratified array batch (DEV-1149)
 track-attachments@fault: missing_feature  # SDK never POSTs events/track: track_ai ships via events/track_partial as a single-object body, not the ratified array batch (DEV-1149)
 track-batch-array@fault: missing_feature  # SDK never POSTs events/track and does no queue batching: each track posts one single-object events/track_partial request immediately (DEV-1149)
