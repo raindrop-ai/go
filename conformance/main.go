@@ -61,6 +61,10 @@ var (
 		// the capability went active once signal UUIDs populate on Query API
 		// reads; signal scenarios are experimental until promoted).
 		"signal",
+		"timing.wait",
+		// `span` maps to the public Client.StartSpan/Span.End surface; the
+		// span ships on the SDK's own trace queue to the traces route.
+		"traces.span",
 	}
 	notApplicable = []string{"wrapper.capture"}
 	// A not_applicable claim must argue "not fixable" (README policy).
@@ -232,6 +236,15 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 		return d.stepFlush(ctx)
 	case "close":
 		return d.stepClose()
+	case "wait":
+		ms, ok := args["ms"].(float64)
+		if !ok {
+			return fmt.Errorf("wait requires a numeric ms")
+		}
+		time.Sleep(time.Duration(ms * float64(time.Millisecond)))
+		return nil
+	case "span":
+		return d.stepSpan(ctx, args)
 	default:
 		return errUnsupported{step: name}
 	}
@@ -346,6 +359,29 @@ func (d *driver) stepClose() error {
 		return err
 	}
 	return client.Close()
+}
+
+func (d *driver) stepSpan(ctx context.Context, args map[string]any) error {
+	client, err := d.requireClient()
+	if err != nil {
+		return err
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return err
+	}
+	var attrs []raindrop.Attribute
+	if raw, ok := args["attributes"].(map[string]any); ok {
+		for key, value := range raw {
+			text, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("span attribute %q must be a string", key)
+			}
+			attrs = append(attrs, raindrop.StringAttr(key, text))
+		}
+	}
+	client.StartSpan(ctx, raindrop.SpanOptions{Name: name, Attributes: attrs}).End()
+	return nil
 }
 
 // -- events ------------------------------------------------------------------
