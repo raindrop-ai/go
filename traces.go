@@ -176,8 +176,7 @@ func (b *traceBuffer) Flush(ctx context.Context) error {
 				b.restoreBatch(batch)
 				return firstErr
 			}
-			// A 4xx other than 408/429, or a NaN/Inf attribute, fails the same way on
-			// every resend: drop the batch so it cannot block later spans forever.
+			// Resending would fail the same way forever, so drop the batch rather than block later spans.
 			b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
 		}
 	}
