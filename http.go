@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -121,7 +122,11 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 	}
 
 	c.postLocalMirror(ctx, path, payload)
+	return c.postPayload(ctx, path, payload, c.maxAttempts)
+}
 
+// postPayload POSTs already-encoded bytes with up to maxAttempts attempts.
+func (c *retryingHTTPClient) postPayload(ctx context.Context, path string, payload []byte, maxAttempts int) error {
 	if c.writeKey == "" {
 		return nil
 	}
@@ -129,7 +134,7 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 	url := c.baseURL + strings.TrimPrefix(path, "/")
 	var lastErr error
 
-	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
 			delay := c.retryDelay(attempt-1, lastErr)
 			if delay > 0 {
@@ -200,11 +205,19 @@ func (c *retryingHTTPClient) postOnce(ctx context.Context, url string, payload [
 		RetryAfter: parseRetryAfter(resp.Header),
 	}
 
-	if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
-		return true, statusErr
-	}
+	return !isRetryable(statusErr), statusErr
+}
 
-	return false, statusErr
+// isRetryable reports whether a failed send may succeed later: network errors,
+// timeouts, 408, 429 and 5xx. Any other status means ingest rejected the
+// payload itself, so resending the same bytes can never succeed.
+func isRetryable(err error) bool {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		code := statusErr.StatusCode
+		return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500
+	}
+	return true
 }
 
 // postLocalMirror runs synchronously but does not propagate errors: the

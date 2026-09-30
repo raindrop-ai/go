@@ -163,13 +163,18 @@ func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
 		return nil
 	}
 
-	if err := b.client.transport.postJSON(ctx, "events/track_partial", payload); err != nil {
+	err := b.client.transport.postJSON(ctx, "events/track_partial", payload)
+	if err != nil && isRetryable(err) {
 		b.restore(eventID, patch)
 		return err
 	}
+	if err != nil {
+		// Restoring a rejected patch would resend it on every tick forever.
+		b.client.logger.Warn("raindrop: dropping event rejected by ingest", "event_id", eventID, "error", err)
+	}
 
 	if payload.IsPending {
-		return nil
+		return err
 	}
 
 	b.mu.Lock()
@@ -177,7 +182,7 @@ func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
 		delete(b.sticky, eventID)
 	}
 	b.mu.Unlock()
-	return nil
+	return err
 }
 
 func (b *eventBuffer) take(eventID string) (eventPatch, stickyEventData, bool) {
