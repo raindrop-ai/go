@@ -2,6 +2,9 @@ package raindrop
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -153,16 +156,28 @@ func (b *traceBuffer) Enqueue(span otlpSpan) {
 }
 
 func (b *traceBuffer) Flush(ctx context.Context) error {
+	var firstErr error
 	for {
 		batch := b.takeBatch()
 		if len(batch) == 0 {
-			return nil
+			return firstErr
 		}
 
 		payload := buildExportTraceServiceRequest(batch, b.client.serviceName, b.client.version)
 		if err := b.client.transport.postJSON(ctx, "traces", payload); err != nil {
-			b.restoreBatch(batch)
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
+			var statusErr *httpStatusError
+			var unencodable *json.UnsupportedValueError
+			rejected := errors.As(err, &statusErr) && statusErr.StatusCode >= 400 && statusErr.StatusCode < 500 &&
+				statusErr.StatusCode != http.StatusRequestTimeout && statusErr.StatusCode != http.StatusTooManyRequests
+			if !rejected && !errors.As(err, &unencodable) {
+				b.restoreBatch(batch)
+				return firstErr
+			}
+			// Resending would fail the same way forever, so drop the batch rather than block later spans.
+			b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
 		}
 	}
 }
