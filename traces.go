@@ -4,26 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"sync"
 	"time"
 )
-
-const (
-	// traceRetryBudget bounds how long the background flusher keeps retrying
-	// one batch, measured from its first attempt. It covers the 226 s ingest
-	// outage of 2026-09-29 with margin and matches the JS/Python SDKs.
-	traceRetryBudget = 300 * time.Second
-	// maxTraceRetryDelay caps the exponential backoff between batch retries.
-	maxTraceRetryDelay = 30 * time.Second
-)
-
-// traceBatch is marshalled once so every retry resends identical bytes.
-type traceBatch struct {
-	payload []byte
-	spans   int
-	first   time.Time
-	retries int
-}
 
 type SpanOptions struct {
 	Name       string
@@ -104,14 +88,6 @@ type traceBuffer struct {
 	// and re-sent by Stop's own bounded flush).
 	runCtx    context.Context
 	runCancel context.CancelFunc
-
-	// pending holds batches that failed with a retryable error. They are sent
-	// before any queued spans, so while ingest is down only the head batch
-	// probes and later spans wait in the bounded queue. A flusher only takes
-	// from the queue when pending is empty, so it holds at most one batch per
-	// concurrent flusher.
-	pending []*traceBatch
-	now     func() time.Time
 }
 
 type spanContextKey struct{}
@@ -127,7 +103,6 @@ func newTraceBuffer(client *Client, flushEvery time.Duration, maxBatchSize, maxQ
 		kickCh:       make(chan struct{}, 1),
 		runCtx:       runCtx,
 		runCancel:    runCancel,
-		now:          time.Now,
 	}
 	if client != nil && client.enabled && flushEvery > 0 {
 		buffer.ticker = time.NewTicker(flushEvery)
@@ -146,9 +121,9 @@ func (b *traceBuffer) run() {
 			}
 			return
 		case <-b.ticker.C:
-			_ = b.flush(b.runCtx, true)
+			_ = b.Flush(b.runCtx)
 		case <-b.kickCh:
-			_ = b.flush(b.runCtx, true)
+			_ = b.Flush(b.runCtx)
 		}
 	}
 }
@@ -180,108 +155,32 @@ func (b *traceBuffer) Enqueue(span otlpSpan) {
 	}
 }
 
-// Flush sends every queued batch with the transport's short retry schedule,
-// so callers (Client.Flush, Close) keep their existing latency bounds.
 func (b *traceBuffer) Flush(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return b.flush(ctx, false)
-}
-
-// flush drains the queue. A rejected batch (non-retryable 4xx) is dropped with
-// a warning so it can never block later spans. In the background, a batch that
-// failed retryably is held and retried with backoff until traceRetryBudget.
-func (b *traceBuffer) flush(ctx context.Context, background bool) error {
-	attempts := b.client.transport.maxAttempts
-	if background {
-		attempts = 1
-	}
-	// dropped keeps Flush/Close returning an error when a batch was not
-	// delivered, as before, while later batches still drain.
-	var dropped error
+	var firstErr error
 	for {
-		batch, encodeErr := b.nextBatch(ctx)
-		if dropped == nil {
-			dropped = encodeErr
+		batch := b.takeBatch()
+		if len(batch) == 0 {
+			return firstErr
 		}
-		if batch == nil {
-			return dropped
-		}
-		err := b.client.transport.postPayload(ctx, "traces", batch.payload, attempts)
-		if err == nil {
-			continue
-		}
-		if !isRetryable(err) {
-			b.client.warnDrop("raindrop: dropping trace batch rejected by ingest", "spans", batch.spans, "error", err)
-			if dropped == nil {
-				dropped = err
+
+		payload := buildExportTraceServiceRequest(batch, b.client.serviceName, b.client.version)
+		if err := b.client.transport.postJSON(ctx, "traces", payload); err != nil {
+			if firstErr == nil {
+				firstErr = err
 			}
-			continue
-		}
-		// Shutdown cancelled the send: hand the batch to Stop's final flush
-		// without charging the retry budget.
-		if !background || ctx.Err() != nil {
-			b.hold(batch)
-			return errors.Join(dropped, err)
-		}
-		batch.retries++
-		delay := b.retryDelay(batch.retries, err)
-		if b.now().Add(delay).Sub(batch.first) > traceRetryBudget {
-			b.client.warnDrop("raindrop: dropping trace batch after retry budget", "spans", batch.spans, "retries", batch.retries, "error", err)
-			continue
-		}
-		b.hold(batch)
-		if err := b.client.transport.sleep(ctx, delay); err != nil {
-			return err
-		}
-	}
-}
-
-// nextBatch returns the held batch first, else marshals the next queued spans.
-// encodeErr is the first error of any batch dropped because it cannot be encoded.
-func (b *traceBuffer) nextBatch(ctx context.Context) (batch *traceBatch, encodeErr error) {
-	b.mu.Lock()
-	if len(b.pending) > 0 {
-		batch := b.pending[0]
-		b.pending = b.pending[1:]
-		b.mu.Unlock()
-		return batch, nil
-	}
-	b.mu.Unlock()
-	for {
-		spans := b.takeBatch()
-		if len(spans) == 0 {
-			return nil, encodeErr
-		}
-		payload, err := json.Marshal(buildExportTraceServiceRequest(spans, b.client.serviceName, b.client.version))
-		if err != nil {
-			b.client.warnDrop("raindrop: dropping trace batch that cannot be encoded", "spans", len(spans), "error", err)
-			if encodeErr == nil {
-				encodeErr = err
+			var statusErr *httpStatusError
+			var unencodable *json.UnsupportedValueError
+			rejected := errors.As(err, &statusErr) && statusErr.StatusCode >= 400 && statusErr.StatusCode < 500 &&
+				statusErr.StatusCode != http.StatusRequestTimeout && statusErr.StatusCode != http.StatusTooManyRequests
+			if !rejected && !errors.As(err, &unencodable) {
+				b.restoreBatch(batch)
+				return firstErr
 			}
-			continue
+			// A 4xx other than 408/429, or a NaN/Inf attribute, fails the same way on
+			// every resend: drop the batch so it cannot block later spans forever.
+			b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
 		}
-		b.client.transport.postLocalMirror(ctx, "traces", payload)
-		return &traceBatch{payload: payload, spans: len(spans), first: b.now()}, encodeErr
 	}
-}
-
-func (b *traceBuffer) hold(batch *traceBatch) {
-	b.mu.Lock()
-	b.pending = append([]*traceBatch{batch}, b.pending...)
-	b.mu.Unlock()
-}
-
-// retryDelay is min(30 s, 1 s·2^(n-1)) with equal jitter, or the server's
-// Retry-After capped at 30 s.
-func (b *traceBuffer) retryDelay(retries int, err error) time.Duration {
-	var statusErr *httpStatusError
-	if errors.As(err, &statusErr) && statusErr.RetryAfter > 0 {
-		return min(statusErr.RetryAfter, maxRetryAfterDelay)
-	}
-	ceiling := min(maxTraceRetryDelay, time.Second<<min(retries-1, 5))
-	return time.Duration(float64(ceiling) * (0.5 + 0.5*b.client.transport.randomFloat()))
 }
 
 // Stop halts the background flusher and runs a final flush bounded by ctx.
@@ -315,6 +214,23 @@ func (b *traceBuffer) takeBatch() []otlpSpan {
 	copy(batch, b.queue[:size])
 	b.queue = append([]otlpSpan{}, b.queue[size:]...)
 	return batch
+}
+
+func (b *traceBuffer) restoreBatch(batch []otlpSpan) {
+	if len(batch) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	restored := make([]otlpSpan, 0, len(batch)+len(b.queue))
+	restored = append(restored, batch...)
+	restored = append(restored, b.queue...)
+	if b.maxQueueSize > 0 && len(restored) > b.maxQueueSize {
+		restored = restored[:b.maxQueueSize]
+	}
+	b.queue = restored
 }
 
 func (c *Client) StartSpan(ctx context.Context, opts SpanOptions) *Span {
