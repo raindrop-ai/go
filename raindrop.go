@@ -42,6 +42,8 @@ type Client struct {
 	closeMu   sync.RWMutex
 
 	interactions sync.Map
+
+	dropWarn dropWarner
 }
 
 func New(opts ...Option) (*Client, error) {
@@ -155,6 +157,36 @@ func (c *Client) ensureOpen() error {
 		return ErrClosed
 	}
 	return nil
+}
+
+// dropWarnInterval bounds drop warnings on the host's logger: a revoked key
+// would otherwise log one line per event and per trace batch.
+const dropWarnInterval = time.Minute
+
+type dropWarner struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+// warnDrop logs at most one drop warning per dropWarnInterval and reports how
+// many were suppressed since the previous one.
+func (c *Client) warnDrop(msg string, args ...any) {
+	w := &c.dropWarn
+	w.mu.Lock()
+	now := time.Now()
+	if !w.last.IsZero() && now.Sub(w.last) < dropWarnInterval {
+		w.suppressed++
+		w.mu.Unlock()
+		return
+	}
+	suppressed := w.suppressed
+	w.last, w.suppressed = now, 0
+	w.mu.Unlock()
+	if suppressed > 0 {
+		args = append(args, "suppressed", suppressed)
+	}
+	c.logger.Warn(msg, args...)
 }
 
 func (c *Client) debugLog(msg string, args ...any) {

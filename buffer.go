@@ -170,7 +170,7 @@ func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
 	}
 	if err != nil {
 		// Restoring a rejected patch would resend it on every tick forever.
-		b.client.logger.Warn("raindrop: dropping event rejected by ingest", "event_id", eventID, "error", err)
+		b.client.warnDrop("raindrop: dropping event rejected by ingest", "event_id", eventID, "error", err)
 	}
 
 	if payload.IsPending {

@@ -197,27 +197,38 @@ func (b *traceBuffer) flush(ctx context.Context, background bool) error {
 	if background {
 		attempts = 1
 	}
+	// dropped keeps Flush/Close returning an error when a batch was not
+	// delivered, as before, while later batches still drain.
+	var dropped error
 	for {
-		batch := b.nextBatch(ctx)
+		batch, encodeErr := b.nextBatch(ctx)
+		if dropped == nil {
+			dropped = encodeErr
+		}
 		if batch == nil {
-			return nil
+			return dropped
 		}
 		err := b.client.transport.postPayload(ctx, "traces", batch.payload, attempts)
 		if err == nil {
 			continue
 		}
 		if !isRetryable(err) {
-			b.client.logger.Warn("raindrop: dropping trace batch rejected by ingest", "spans", batch.spans, "error", err)
+			b.client.warnDrop("raindrop: dropping trace batch rejected by ingest", "spans", batch.spans, "error", err)
+			if dropped == nil {
+				dropped = err
+			}
 			continue
 		}
-		if !background {
+		// Shutdown cancelled the send: hand the batch to Stop's final flush
+		// without charging the retry budget.
+		if !background || ctx.Err() != nil {
 			b.hold(batch)
-			return err
+			return errors.Join(dropped, err)
 		}
 		batch.retries++
 		delay := b.retryDelay(batch.retries, err)
 		if b.now().Add(delay).Sub(batch.first) > traceRetryBudget {
-			b.client.logger.Warn("raindrop: dropping trace batch after retry budget", "spans", batch.spans, "retries", batch.retries, "error", err)
+			b.client.warnDrop("raindrop: dropping trace batch after retry budget", "spans", batch.spans, "retries", batch.retries, "error", err)
 			continue
 		}
 		b.hold(batch)
@@ -228,27 +239,31 @@ func (b *traceBuffer) flush(ctx context.Context, background bool) error {
 }
 
 // nextBatch returns the held batch first, else marshals the next queued spans.
-func (b *traceBuffer) nextBatch(ctx context.Context) *traceBatch {
+// encodeErr is the first error of any batch dropped because it cannot be encoded.
+func (b *traceBuffer) nextBatch(ctx context.Context) (batch *traceBatch, encodeErr error) {
 	b.mu.Lock()
 	if len(b.pending) > 0 {
 		batch := b.pending[0]
 		b.pending = b.pending[1:]
 		b.mu.Unlock()
-		return batch
+		return batch, nil
 	}
 	b.mu.Unlock()
 	for {
 		spans := b.takeBatch()
 		if len(spans) == 0 {
-			return nil
+			return nil, encodeErr
 		}
 		payload, err := json.Marshal(buildExportTraceServiceRequest(spans, b.client.serviceName, b.client.version))
 		if err != nil {
-			b.client.logger.Warn("raindrop: dropping trace batch that cannot be encoded", "spans", len(spans), "error", err)
+			b.client.warnDrop("raindrop: dropping trace batch that cannot be encoded", "spans", len(spans), "error", err)
+			if encodeErr == nil {
+				encodeErr = err
+			}
 			continue
 		}
 		b.client.transport.postLocalMirror(ctx, "traces", payload)
-		return &traceBatch{payload: payload, spans: len(spans), first: b.now()}
+		return &traceBatch{payload: payload, spans: len(spans), first: b.now()}, encodeErr
 	}
 }
 
