@@ -1,3 +1,3 @@
 package raindrop
 
-const Version = "0.1.7"
+const Version = "0.2.0"

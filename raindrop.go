@@ -25,6 +25,7 @@ var ErrClosed = errors.New("raindrop: client closed")
 
 type Client struct {
 	transport         *retryingHTTPClient
+	track             *trackQueue
 	events            *eventBuffer
 	traces            *traceBuffer
 	logger            *slog.Logger
@@ -85,6 +86,7 @@ func New(opts ...Option) (*Client, error) {
 	client.appGit = newAppGitState(cfg.appGit)
 
 	client.transport = newRetryingHTTPClient(cfg, resolvedLocal)
+	client.track = newTrackQueue(client, cfg.partialFlushInterval, defaultTrackBatchSize, defaultTrackQueueSize)
 	client.events = newEventBuffer(client, cfg.partialFlushInterval)
 	client.traces = newTraceBuffer(client, cfg.traceFlushInterval, cfg.traceBatchSize, cfg.traceQueueSize)
 
@@ -104,6 +106,10 @@ func (c *Client) Enabled() bool {
 	return c != nil && c.enabled
 }
 
+// Flush sends everything queued before it, including sends already in
+// flight on the background goroutines, and returns once it was handed to
+// ingest (CONTRACT 1.2). Without a deadline on ctx it is bounded by the
+// close timeout (WithCloseTimeout, default 10s).
 func (c *Client) Flush(ctx context.Context) error {
 	if c == nil || !c.enabled {
 		return nil
@@ -111,14 +117,20 @@ func (c *Client) Flush(ctx context.Context) error {
 	if err := c.ensureOpen(); err != nil {
 		return err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		timeout := c.closeTimeout
+		if timeout <= 0 {
+			timeout = defaultCloseTimeout
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
-	if err := c.events.Flush(ctx); err != nil {
-		return err
-	}
-	if err := c.traces.Flush(ctx); err != nil {
-		return err
-	}
-	return nil
+	return errors.Join(c.track.Flush(ctx), c.events.Flush(ctx), c.traces.Flush(ctx))
 }
 
 // Close flushes pending telemetry and stops the background goroutines,
@@ -143,7 +155,7 @@ func (c *Client) Close() error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		closeErr = errors.Join(c.events.Stop(ctx), c.traces.Stop(ctx))
+		closeErr = errors.Join(c.track.Stop(ctx), c.events.Stop(ctx), c.traces.Stop(ctx))
 	})
 	return closeErr
 }

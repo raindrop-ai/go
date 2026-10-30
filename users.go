@@ -27,5 +27,7 @@ func (c *Client) Identify(ctx context.Context, user User) error {
 	if payload.Traits == nil {
 		payload.Traits = map[string]any{}
 	}
-	return c.transport.postJSON(ctx, "users/identify", payload)
+	// Queued, never sent on the caller (CONTRACT 1.1).
+	c.track.Enqueue(routeUsersIdentify, payload)
+	return nil
 }

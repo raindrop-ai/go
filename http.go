@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +28,9 @@ const (
 	// maxRetryAfterDelay caps how long a server-provided Retry-After header
 	// can delay the next attempt.
 	maxRetryAfterDelay = 30 * time.Second
+	// maxIngestResponseBytes bounds how much of a 2xx body is read to look
+	// for ingest's rejected/warnings report.
+	maxIngestResponseBytes = 1 << 20
 
 	// projectIDHeader routes telemetry to a specific Raindrop project when set.
 	projectIDHeader = "X-Raindrop-Project-Id"
@@ -72,6 +76,13 @@ type retryingHTTPClient struct {
 	attemptTimeout time.Duration
 	sleep          func(context.Context, time.Duration) error
 	randomFloat    func() float64
+	warnings       *warnLimiter
+
+	// pausedUntil is when sending may resume after a 429 or 503 carrying
+	// Retry-After: the server asked for less traffic, so every send waits,
+	// not just the retry of the rejected request (CONTRACT 15.2).
+	pauseMu     sync.Mutex
+	pausedUntil time.Time
 }
 
 type httpStatusError struct {
@@ -108,6 +119,7 @@ func newRetryingHTTPClient(cfg config, localBaseURL string) *retryingHTTPClient 
 		attemptTimeout: defaultAttemptTimeout,
 		sleep:          sleepContext,
 		randomFloat:    rand.Float64,
+		warnings:       newWarnLimiter(),
 	}
 }
 
@@ -138,8 +150,11 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 				}
 			}
 		}
+		if err := c.waitForPause(ctx); err != nil {
+			return err
+		}
 
-		done, err := c.postOnce(ctx, url, payload)
+		done, err := c.postOnce(ctx, path, url, payload)
 		if done {
 			return err
 		}
@@ -152,10 +167,40 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 	return nil
 }
 
+// waitForPause holds a send until an overload pause ends, bounded by ctx.
+func (c *retryingHTTPClient) waitForPause(ctx context.Context) error {
+	c.pauseMu.Lock()
+	until := c.pausedUntil
+	c.pauseMu.Unlock()
+	if wait := time.Until(until); wait > 0 {
+		return c.sleep(ctx, wait)
+	}
+	return nil
+}
+
+func (c *retryingHTTPClient) notePause(statusCode int, retryAfter time.Duration) {
+	if retryAfter <= 0 || (statusCode != http.StatusTooManyRequests && statusCode != http.StatusServiceUnavailable) {
+		return
+	}
+	until := time.Now().Add(min(retryAfter, maxRetryAfterDelay))
+	c.pauseMu.Lock()
+	if until.After(c.pausedUntil) {
+		c.pausedUntil = until
+	}
+	c.pauseMu.Unlock()
+}
+
+// isRetryableStatus reports whether a non-2xx status is transient: 408 and
+// 429 are the transient 4xx, every 5xx is retried, and every other 4xx is a
+// permanent rejection that must not be retried (CONTRACT 3 and 15.2).
+func isRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests || statusCode >= 500
+}
+
 // postOnce performs a single POST attempt. done reports whether the retry
 // loop should stop (success, permanent failure, or caller context done);
 // when done is false the returned error is the retryable lastErr.
-func (c *retryingHTTPClient) postOnce(ctx context.Context, url string, payload []byte) (done bool, err error) {
+func (c *retryingHTTPClient) postOnce(ctx context.Context, path, url string, payload []byte) (done bool, err error) {
 	// Bound the attempt even when the configured http.Client carries no
 	// Timeout (the zero value is unbounded — a stalled connection would hang
 	// the flush goroutine, and Close, forever). context deadlines compose,
@@ -186,7 +231,9 @@ func (c *retryingHTTPClient) postOnce(ctx context.Context, url string, payload [
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxIngestResponseBytes))
 		_ = resp.Body.Close()
+		c.reportIngestResponse(path, body)
 		return true, nil
 	}
 
@@ -200,7 +247,11 @@ func (c *retryingHTTPClient) postOnce(ctx context.Context, url string, payload [
 		RetryAfter: parseRetryAfter(resp.Header),
 	}
 
-	if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+	c.notePause(resp.StatusCode, statusErr.RetryAfter)
+	if !isRetryableStatus(resp.StatusCode) {
+		c.warnings.warn(c.logger, path+".rejected",
+			"raindrop: ingest rejected the payload (permanent); dropping it",
+			"route", path, "status", resp.StatusCode, "body", statusErr.Body)
 		return true, statusErr
 	}
 
@@ -268,21 +319,19 @@ func (c *retryingHTTPClient) setProjectIDHeader(req *http.Request) {
 }
 
 func (c *retryingHTTPClient) retryDelay(retryNumber int, previous error) time.Duration {
-	if statusErr, ok := previous.(*httpStatusError); ok && statusErr.RetryAfter > 0 {
-		// Clamp server-controlled values: an arbitrary Retry-After (hours,
-		// days) would otherwise park the flush goroutine for that long.
-		return min(statusErr.RetryAfter, maxRetryAfterDelay)
-	}
-
 	delay := c.baseDelay << (retryNumber - 1)
-	if c.jitterFraction <= 0 {
-		return delay
+	if c.jitterFraction > 0 {
+		jitterMin := 1 - c.jitterFraction
+		jitterMax := 1 + c.jitterFraction
+		factor := jitterMin + (jitterMax-jitterMin)*c.randomFloat()
+		delay = time.Duration(float64(delay) * factor)
 	}
-
-	jitterMin := 1 - c.jitterFraction
-	jitterMax := 1 + c.jitterFraction
-	factor := jitterMin + (jitterMax-jitterMin)*c.randomFloat()
-	return time.Duration(float64(delay) * factor)
+	if statusErr, ok := previous.(*httpStatusError); ok && statusErr.RetryAfter > 0 {
+		// Wait at least what the server asked for, clamped: an arbitrary
+		// Retry-After (hours, days) would otherwise park the flush goroutine.
+		delay = max(delay, min(statusErr.RetryAfter, maxRetryAfterDelay))
+	}
+	return delay
 }
 
 func formatEndpoint(endpoint string) string {

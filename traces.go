@@ -16,25 +16,41 @@ type SpanOptions struct {
 	Properties map[string]any
 	Attributes []Attribute
 	StartTime  time.Time
+	// ParentContext places the span under a span this process never saw,
+	// such as ids another process saved with the event. Parent wins when
+	// both are set.
+	ParentContext *SpanContext
+}
+
+// SpanContext identifies a span by its W3C ids, lowercase hex: a 32-character
+// trace id and a 16-character span id.
+type SpanContext struct {
+	TraceID string
+	SpanID  string
 }
 
 type ToolOptions struct {
-	Parent     *Span
-	Properties map[string]any
-	Input      any
-	StartTime  time.Time
+	Parent        *Span
+	ParentContext *SpanContext
+	Properties    map[string]any
+	Input         any
+	StartTime     time.Time
 }
 
+// TrackToolOptions records a tool call after the fact: StartTime plus
+// Duration or EndTime (EndTime wins when both are set). ParentContext places
+// it under a saved parent span (CONTRACT 12.2).
 type TrackToolOptions struct {
-	Name       string
-	Parent     *Span
-	Input      any
-	Output     any
-	Error      error
-	Properties map[string]any
-	StartTime  time.Time
-	EndTime    time.Time
-	Duration   time.Duration
+	Name          string
+	Parent        *Span
+	ParentContext *SpanContext
+	Input         any
+	Output        any
+	Error         error
+	Properties    map[string]any
+	StartTime     time.Time
+	EndTime       time.Time
+	Duration      time.Duration
 }
 
 type Span struct {
@@ -256,6 +272,9 @@ func (c *Client) StartSpan(ctx context.Context, opts SpanOptions) *Span {
 	appGit = appGitForSpan(appGit, opts.Properties, opts.Attributes, c.textFieldLimit())
 
 	ids, err := createSpanIDs(parent)
+	if err == nil && parent == nil && opts.ParentContext != nil {
+		ids, err = spanIDsUnder(*opts.ParentContext, ids)
+	}
 	if err != nil {
 		c.debugLog("failed to create span IDs", "error", err)
 		return &Span{}
@@ -312,6 +331,9 @@ func (i *Interaction) StartSpan(opts SpanOptions) *Span {
 	if opts.EventID == "" {
 		opts.EventID = i.eventID
 	}
+	if len(i.spanAttributes) > 0 {
+		opts.Attributes = append(append([]Attribute{}, opts.Attributes...), i.spanAttributes...)
+	}
 	span := i.client.StartSpan(i.ctx, opts)
 	if span != nil && opts.Parent == nil && SpanFromContext(i.ctx) == nil {
 		span.mu.Lock()
@@ -353,12 +375,13 @@ func (i *Interaction) StartToolSpan(name string, opts ToolOptions) *ToolSpan {
 		}
 	}
 	span := i.StartSpan(SpanOptions{
-		Name:       name,
-		EventID:    i.eventID,
-		Parent:     opts.Parent,
-		StartTime:  opts.StartTime,
-		Properties: properties,
-		Attributes: buildToolAttributes(name, opts.Input, nil, 0, nil, i.client.textFieldLimit()),
+		Name:          name,
+		EventID:       i.eventID,
+		Parent:        opts.Parent,
+		ParentContext: opts.ParentContext,
+		StartTime:     opts.StartTime,
+		Properties:    properties,
+		Attributes:    buildToolAttributes(name, opts.Input, nil, 0, nil, i.client.textFieldLimit()),
 	})
 	return &ToolSpan{
 		span:  span,
@@ -406,13 +429,18 @@ func (t *Tracer) TrackTool(opts TrackToolOptions) {
 	if startTime.IsZero() && opts.Duration > 0 {
 		startTime = time.Now().UTC().Add(-opts.Duration)
 	}
+	if endTime.IsZero() && !startTime.IsZero() && opts.Duration > 0 {
+		// Start plus duration fixes the end exactly (CONTRACT 12.1).
+		endTime = startTime.Add(opts.Duration)
+	}
 
 	span := t.StartSpan(SpanOptions{
-		Name:       opts.Name,
-		Parent:     opts.Parent,
-		StartTime:  startTime,
-		Properties: opts.Properties,
-		Attributes: buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, nil, t.client.textFieldLimit()),
+		Name:          opts.Name,
+		Parent:        opts.Parent,
+		ParentContext: opts.ParentContext,
+		StartTime:     startTime,
+		Properties:    opts.Properties,
+		Attributes:    buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, nil, t.client.textFieldLimit()),
 	})
 	if opts.Error != nil {
 		span.SetError(opts.Error)
@@ -441,12 +469,17 @@ func (i *Interaction) TrackTool(opts TrackToolOptions) {
 	if startTime.IsZero() && opts.Duration > 0 {
 		startTime = time.Now().UTC().Add(-opts.Duration)
 	}
+	if endTime.IsZero() && !startTime.IsZero() && opts.Duration > 0 {
+		// Start plus duration fixes the end exactly (CONTRACT 12.1).
+		endTime = startTime.Add(opts.Duration)
+	}
 
 	toolSpan := i.StartToolSpan(opts.Name, ToolOptions{
-		Parent:     opts.Parent,
-		Properties: opts.Properties,
-		Input:      opts.Input,
-		StartTime:  startTime,
+		Parent:        opts.Parent,
+		ParentContext: opts.ParentContext,
+		Properties:    opts.Properties,
+		Input:         opts.Input,
+		StartTime:     startTime,
 	})
 	toolSpan.SetOutput(opts.Output)
 	if opts.Error != nil {

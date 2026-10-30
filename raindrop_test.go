@@ -15,15 +15,15 @@ import (
 	"time"
 )
 
-func TestTrackAISendsTrackPartialPayload(t *testing.T) {
-	var received trackPartialPayload
+func TestTrackAIQueuesForEventsTrack(t *testing.T) {
+	var received []trackEventPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/events/track_partial" {
+		if r.URL.Path != "/events/track" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &received); err != nil {
-			t.Fatalf("unmarshal payload: %v", err)
+			t.Fatalf("unmarshal payload (want an array): %v", err)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -48,19 +48,29 @@ func TestTrackAISendsTrackPartialPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("track ai: %v", err)
 	}
+	if len(received) != 0 {
+		t.Fatalf("TrackAI sent on the caller before Flush (CONTRACT 1.1)")
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
-	if received.EventID != "evt_123" {
-		t.Fatalf("unexpected event id: %s", received.EventID)
+	if len(received) != 1 {
+		t.Fatalf("received %d events, want 1", len(received))
 	}
-	if received.AIData == nil || received.AIData.Model != "gpt-4o" {
-		t.Fatalf("missing ai_data model: %#v", received.AIData)
+	event := received[0]
+	if event.EventID != "evt_123" || event.UserID != "user-123" {
+		t.Fatalf("unexpected identity: %#v", event)
 	}
-	if received.IsPending {
-		t.Fatalf("expected finalized event")
+	if event.AIData == nil || event.AIData.Model != "gpt-4o" || event.AIData.ConvoID != "conv-123" {
+		t.Fatalf("missing ai_data: %#v", event.AIData)
 	}
-	contextValue, ok := received.Properties["$context"].(map[string]any)
+	if _, err := time.Parse(time.RFC3339, event.Timestamp); err != nil {
+		t.Fatalf("timestamp %q: %v", event.Timestamp, err)
+	}
+	contextValue, ok := event.Properties["$context"].(map[string]any)
 	if !ok {
-		t.Fatalf("missing $context: %#v", received.Properties)
+		t.Fatalf("missing $context: %#v", event.Properties)
 	}
 	library, ok := contextValue["library"].(map[string]any)
 	if !ok || library["name"] != defaultLibraryName {
@@ -155,6 +165,12 @@ func TestTrackSignalAndIdentifyUseExpectedEndpoints(t *testing.T) {
 		Traits: map[string]any{"plan": "paid"},
 	}); err != nil {
 		t.Fatalf("identify: %v", err)
+	}
+	if signalCalls != 0 || identifyCalls != 0 {
+		t.Fatalf("signal/identify sent on the caller before Flush (CONTRACT 1.1)")
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	if signalCalls != 1 {
@@ -623,6 +639,9 @@ func TestRetryOnRetryableStatuses(t *testing.T) {
 		UserID:  "user-123",
 	}); err != nil {
 		t.Fatalf("track ai: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	if attempts.Load() != 3 {
