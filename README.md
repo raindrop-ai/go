@@ -28,9 +28,9 @@ client, err := raindrop.New(
 ```
 
 All outbound HTTP carries finite deadlines — even when a custom
-`WithHTTPClient` has no `Timeout` — and `Close()` runs its final flush under
-a hard deadline (`WithCloseTimeout`, default 10s) so a dead network can
-never wedge your process exit.
+`WithHTTPClient` has no `Timeout` — and `Flush()` and `Close()` share one
+deadline (`WithFlushTimeout`, default 10s) so a dead network can never wedge
+your process exit.
 
 ## Quick Start: Interaction API
 
@@ -273,7 +273,8 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - `WithServiceVersion(string)`: Overrides the OTLP service version and default library version.
 - `WithLibraryVersion(string)`: Overrides the `$context.library.version` event metadata.
 - `WithMaxTextFieldChars(int)`: Sets the per-field byte cap applied to event input/output, event property and attachment values, and serialized tool span content before serialization. Defaults to `1000000`. Non-positive values are ignored.
-- `WithCloseTimeout(time.Duration)`: Sets the hard deadline for `Close()`'s final flush; once it passes, in-flight sends are aborted and remaining payloads are dropped. Defaults to `10s`. Non-positive values are ignored.
+- `WithFlushTimeout(time.Duration)`: Sets the one deadline for `Flush()` and `Close()`, which each request's timeout is clamped to. Defaults to `10s`. Non-positive values are ignored.
+- `WithCloseTimeout(time.Duration)`: The former name of `WithFlushTimeout`; sets the same deadline.
 - `WithLogger(*slog.Logger)`: Uses a custom structured logger.
 - `WithAppGit(AppGitOptions)`: Configures application Git provenance and automatic discovery.
 - `WithAppGitDisabled()`: Disables client-level Git provenance enrichment.
@@ -373,7 +374,9 @@ The local POST uses a 2s timeout, no retries, and errors are logged at `debug` l
 - `TrackAI()`, `TrackEvent()`, `TrackSignal()` and `Identify()` queue their payload and return immediately. Complete events are sent in batches to `/events/track`, signals to `/signals/track`, and identify calls to `/users/identify`.
 - `Begin()`/`Patch()`/`Finish()` events are sent to `/events/track_partial`. Every request for an event carries its start time: the `Timestamp` passed to `Begin()`, else the time `Begin()` was called. A later timestamp only replaces it when earlier.
 - Finalized events always send `is_pending=false`.
-- `Flush()` returns once everything queued before it, including sends already in progress, was handed to the API, bounded by `WithCloseTimeout` when the context has no deadline. `Close()` does the same and stops the background goroutines.
+- `Flush()` returns once everything queued before it, including sends already in progress, was handed to the API, bounded by `WithFlushTimeout` when the context has no deadline. When the deadline passes first, payloads that were not sent yet, or were waiting on a retry or `Retry-After`, stay queued for the background sender; a request cut off mid-flight is dropped, since it may already have reached the API.
+- `Close()` does the same under the same deadline, stops the background goroutines, and drops whatever is still unsent when the deadline passes.
+- When either returns with something undelivered, it logs a warning and returns an error wrapping `raindrop.ErrUndelivered`. The error is safe to ignore: log it if you like, but don't treat it as a failure of your own work. A payload the API rejected permanently was delivered, so it isn't reported there.
 - 408, 429 and 5xx responses are retried, waiting at least the `Retry-After` the server sends (capped at 30s); a 429 or 503 with `Retry-After` pauses every send to the API for that time. Any other 4xx is a permanent rejection: the payload is dropped with a warning and never retried.
 - When the API accepts a request but lists `rejected` items or `warnings` in its response, they are logged as warnings.
 - Traces are sent as OTLP JSON to `/traces`.

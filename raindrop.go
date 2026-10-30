@@ -3,6 +3,7 @@ package raindrop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"strings"
@@ -16,9 +17,11 @@ const (
 	defaultServiceName = "raindrop.go-sdk"
 	defaultEventName   = "ai_generation"
 
-	// defaultCloseTimeout bounds Close's final flush so a dead or slow
-	// network can never wedge the host process's exit path.
-	defaultCloseTimeout = 10 * time.Second
+	// defaultFlushTimeout is the one deadline for Flush and Close
+	// (CONTRACT 1.2.1): a dead or slow network must never wedge either.
+	defaultFlushTimeout = 10 * time.Second
+	// defaultCloseTimeout is the former name of defaultFlushTimeout.
+	defaultCloseTimeout = defaultFlushTimeout
 )
 
 var ErrClosed = errors.New("raindrop: client closed")
@@ -35,7 +38,7 @@ type Client struct {
 	version           string
 	contextData       map[string]any
 	maxTextFieldChars int
-	closeTimeout      time.Duration
+	flushTimeout      time.Duration
 	appGit            *appGitState
 
 	closeOnce sync.Once
@@ -68,7 +71,7 @@ func New(opts ...Option) (*Client, error) {
 		serviceName:       cfg.serviceName,
 		version:           cfg.serviceVersion,
 		maxTextFieldChars: cfg.maxTextFieldChars,
-		closeTimeout:      cfg.closeTimeout,
+		flushTimeout:      cfg.flushTimeout,
 		contextData: map[string]any{
 			"library": map[string]any{
 				"name":    cfg.libraryName,
@@ -106,10 +109,25 @@ func (c *Client) Enabled() bool {
 	return c != nil && c.enabled
 }
 
+// ErrUndelivered is wrapped by the error Flush and Close return when some
+// telemetry enqueued before the call was not handed to ingest: the deadline
+// passed, or retries ran out. It is safe to ignore: the SDK has already
+// logged a warning, and nothing else changes (CONTRACT 1.2.1). A payload
+// ingest rejected permanently (a 4xx other than 408 and 429) was delivered
+// and is not reported here.
+var ErrUndelivered = errors.New("raindrop: telemetry not delivered")
+
 // Flush sends everything queued before it, including sends already in
 // flight on the background goroutines, and returns once it was handed to
 // ingest (CONTRACT 1.2). Without a deadline on ctx it is bounded by the
-// close timeout (WithCloseTimeout, default 10s).
+// flush timeout (WithFlushTimeout, default 10s), which each request's
+// timeout is clamped to.
+//
+// When the deadline passes, payloads that were not sent yet, or were waiting
+// on a retry or an overload pause, stay queued for the background sender; a
+// request cut off mid-flight is dropped, since it may already have reached
+// ingest. Flush then logs a warning and returns an error wrapping
+// ErrUndelivered, which is safe to ignore.
 func (c *Client) Flush(ctx context.Context) error {
 	if c == nil || !c.enabled {
 		return nil
@@ -121,23 +139,20 @@ func (c *Client) Flush(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	if _, ok := ctx.Deadline(); !ok {
-		timeout := c.closeTimeout
-		if timeout <= 0 {
-			timeout = defaultCloseTimeout
-		}
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+		ctx, cancel = context.WithTimeout(ctx, c.deadline())
 		defer cancel()
 	}
 
-	return errors.Join(c.track.Flush(ctx), c.events.Flush(ctx), c.traces.Flush(ctx))
+	return c.undelivered("flush", errors.Join(c.track.Flush(ctx), c.events.Flush(ctx), c.traces.Flush(ctx)))
 }
 
 // Close flushes pending telemetry and stops the background goroutines,
-// under a hard overall deadline (WithCloseTimeout, default 10s): typically
-// called on the host's shutdown path, it must never wedge process exit on a
-// dead or slow network. Once the deadline passes, in-flight sends are
-// aborted and remaining payloads are dropped.
+// under the same deadline as Flush (WithFlushTimeout, default 10s):
+// typically called on the host's shutdown path, it must never wedge process
+// exit on a dead or slow network. Once the deadline passes, in-flight sends
+// are aborted and remaining payloads are dropped with a warning; the
+// returned error wraps ErrUndelivered and is safe to ignore.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
@@ -149,15 +164,29 @@ func (c *Client) Close() error {
 		c.closed = true
 		c.closeMu.Unlock()
 
-		timeout := c.closeTimeout
-		if timeout <= 0 {
-			timeout = defaultCloseTimeout
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), c.deadline())
 		defer cancel()
-		closeErr = errors.Join(c.track.Stop(ctx), c.events.Stop(ctx), c.traces.Stop(ctx))
+		closeErr = c.undelivered("close", errors.Join(c.track.Stop(ctx), c.events.Stop(ctx), c.traces.Stop(ctx)))
 	})
 	return closeErr
+}
+
+// deadline is the one Flush/Close deadline (CONTRACT 1.2.1).
+func (c *Client) deadline() time.Duration {
+	if c.flushTimeout <= 0 {
+		return defaultFlushTimeout
+	}
+	return c.flushTimeout
+}
+
+// undelivered logs and wraps a drain error, or returns nil.
+func (c *Client) undelivered(call string, err error) error {
+	if err == nil {
+		return nil
+	}
+	c.warn(call+".undelivered",
+		"raindrop: "+call+" returned before all telemetry was delivered", "error", err)
+	return fmt.Errorf("%w: %w", ErrUndelivered, err)
 }
 
 func (c *Client) ensureOpen() error {

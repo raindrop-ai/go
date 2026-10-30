@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"sync"
 	"time"
 )
@@ -181,19 +180,26 @@ func (b *traceBuffer) Flush(ctx context.Context) error {
 
 		payload := buildExportTraceServiceRequest(batch, b.client.serviceName, b.client.version)
 		if err := b.client.transport.postJSON(ctx, "traces", payload); err != nil {
+			var unencodable *json.UnsupportedValueError
+			if isPermanentRejection(err) || errors.As(err, &unencodable) {
+				// Resending would fail the same way forever, so drop the batch
+				// rather than block later spans. Delivered and rejected (or
+				// never sendable): not a flush failure.
+				b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
+				continue
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
-			var statusErr *httpStatusError
-			var unencodable *json.UnsupportedValueError
-			rejected := errors.As(err, &statusErr) && statusErr.StatusCode >= 400 && statusErr.StatusCode < 500 &&
-				statusErr.StatusCode != http.StatusRequestTimeout && statusErr.StatusCode != http.StatusTooManyRequests
-			if !rejected && !errors.As(err, &unencodable) {
-				b.restoreBatch(batch)
+			if ctx.Err() != nil && !isUnsent(err) {
+				// Cut off mid-request at the deadline: it may already have
+				// reached ingest, so it is dropped rather than resent.
+				b.client.warn("traces.dropped",
+					"raindrop: a trace batch was cut off at the deadline; dropping it", "spans", len(batch))
 				return firstErr
 			}
-			// Resending would fail the same way forever, so drop the batch rather than block later spans.
-			b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
+			b.restoreBatch(batch)
+			return firstErr
 		}
 	}
 }
@@ -209,7 +215,16 @@ func (b *traceBuffer) Stop(ctx context.Context) error {
 	if b.ticker != nil {
 		<-b.doneCh
 	}
-	return b.Flush(ctx)
+	err := b.Flush(ctx)
+	b.mu.Lock()
+	left := len(b.queue)
+	b.queue = nil
+	b.mu.Unlock()
+	if left > 0 {
+		b.client.warn("traces.close_dropped",
+			"raindrop: close deadline passed; dropping spans that were not sent", "spans", left)
+	}
+	return err
 }
 
 func (b *traceBuffer) takeBatch() []otlpSpan {

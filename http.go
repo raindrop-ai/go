@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -85,6 +86,35 @@ type retryingHTTPClient struct {
 	pausedUntil time.Time
 }
 
+// unsentError reports that the caller's deadline passed while the payload
+// was waiting to be sent: before its first attempt, during a retry delay, or
+// during an overload pause. Nothing was on the wire, so the payload can stay
+// queued (CONTRACT 1.2.1). A deadline that ends an attempt mid-request
+// surfaces as the bare context error instead: that request may already have
+// reached ingest, so it is not resent.
+type unsentError struct {
+	cause error
+}
+
+func (e *unsentError) Error() string {
+	return "raindrop: deadline passed before the payload was sent: " + e.cause.Error()
+}
+
+func (e *unsentError) Unwrap() error { return e.cause }
+
+// isUnsent reports whether err means the payload never went out (see unsentError).
+func isUnsent(err error) bool {
+	var unsent *unsentError
+	return errors.As(err, &unsent)
+}
+
+// isPermanentRejection reports whether err is a non-retryable HTTP status:
+// ingest received the payload and rejected it for good.
+func isPermanentRejection(err error) bool {
+	var statusErr *httpStatusError
+	return errors.As(err, &statusErr) && !isRetryableStatus(statusErr.StatusCode)
+}
+
 type httpStatusError struct {
 	StatusCode int
 	Status     string
@@ -146,12 +176,15 @@ func (c *retryingHTTPClient) postJSON(ctx context.Context, path string, body any
 			delay := c.retryDelay(attempt-1, lastErr)
 			if delay > 0 {
 				if err := c.sleep(ctx, delay); err != nil {
-					return err
+					return &unsentError{cause: err}
 				}
 			}
 		}
 		if err := c.waitForPause(ctx); err != nil {
-			return err
+			return &unsentError{cause: err}
+		}
+		if err := ctx.Err(); err != nil {
+			return &unsentError{cause: err}
 		}
 
 		done, err := c.postOnce(ctx, path, url, payload)

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -488,5 +489,140 @@ func TestResumeSubagentWithoutACarrierRunsUnlinked(t *testing.T) {
 	}
 	if server.count("/events/track_partial") != 1 {
 		t.Fatalf("a child with an unreadable carrier must still report its own event")
+	}
+}
+
+// -- CONTRACT 1.2.1: one deadline, what happens to payloads when it passes --
+
+func TestOneSettingGovernsFlushAndClose(t *testing.T) {
+	for name, opt := range map[string]Option{
+		"WithFlushTimeout": WithFlushTimeout(250 * time.Millisecond),
+		"WithCloseTimeout": WithCloseTimeout(250 * time.Millisecond),
+	} {
+		client := newTestClient(t, "http://localhost:1/", opt)
+		if got := client.deadline(); got != 250*time.Millisecond {
+			t.Errorf("%s: deadline = %s, want 250ms", name, got)
+		}
+		_ = client.Close()
+	}
+	client := newTestClient(t, "http://localhost:1/")
+	defer func() { _ = client.Close() }()
+	if got := client.deadline(); got != defaultFlushTimeout {
+		t.Errorf("default deadline = %s, want %s", got, defaultFlushTimeout)
+	}
+}
+
+func TestFlushDeadlineKeepsUnsentPayloadsQueued(t *testing.T) {
+	var answered atomic.Int32
+	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if answered.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return true
+		}
+		return false
+	})
+	logger, logs := warnLogger()
+	client := newTestClient(t, server.URL+"/", WithFlushTimeout(300*time.Millisecond), WithLogger(logger))
+	defer func() { _ = client.Close() }()
+
+	if err := client.TrackEvent(context.Background(), Event{UserID: "user", Event: "kept"}); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err := client.Flush(context.Background())
+	if !errors.Is(err, ErrUndelivered) {
+		t.Fatalf("Flush() error = %v, want ErrUndelivered", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Flush took %s, want about its 300ms deadline", elapsed)
+	}
+	if !strings.Contains(logs.String(), "flush returned before all telemetry was delivered") {
+		t.Fatalf("no warning logged: %s", logs.String())
+	}
+
+	// The event waited out the Retry-After in the queue, not in the bin.
+	time.Sleep(1100 * time.Millisecond)
+	flushOrFail(t, client)
+	server.mu.Lock()
+	bodies := server.bodies["/events/track"]
+	server.mu.Unlock()
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+		t.Fatalf("events/track bodies = %d, want the same batch twice (a 503, then delivered)", len(bodies))
+	}
+}
+
+func TestFlushDeadlineDropsACutOffRequest(t *testing.T) {
+	release := make(chan struct{})
+	var answered atomic.Int32
+	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if answered.Add(1) == 1 {
+			<-release // hold the first request past the deadline
+		}
+		return false
+	})
+	t.Cleanup(func() { close(release) })
+	logger, logs := warnLogger()
+	client := newTestClient(t, server.URL+"/", WithFlushTimeout(300*time.Millisecond), WithLogger(logger))
+	defer func() { _ = client.Close() }()
+
+	if err := client.TrackEvent(context.Background(), Event{UserID: "user", Event: "cut-off"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Flush(context.Background()); !errors.Is(err, ErrUndelivered) {
+		t.Fatalf("Flush() error = %v, want ErrUndelivered", err)
+	}
+	if !strings.Contains(logs.String(), "dropping") {
+		t.Fatalf("no drop warning: %s", logs.String())
+	}
+	// It may already have reached ingest, so it is not sent again.
+	flushOrFail(t, client)
+	if got := server.count("/events/track"); got != 1 {
+		t.Fatalf("events/track requests = %d, want 1 (a cut-off request is not resent)", got)
+	}
+}
+
+func TestCloseDropsWhatIsLeftAtTheDeadline(t *testing.T) {
+	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return true
+	})
+	logger, logs := warnLogger()
+	client := newTestClient(t, server.URL+"/", WithFlushTimeout(300*time.Millisecond), WithLogger(logger))
+
+	if err := client.TrackEvent(context.Background(), Event{UserID: "user", Event: "left"}); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := client.Close(); !errors.Is(err, ErrUndelivered) {
+		t.Fatalf("Close() error = %v, want ErrUndelivered", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Close took %s, want about its 300ms deadline", elapsed)
+	}
+	if !strings.Contains(logs.String(), "dropping") {
+		t.Fatalf("no drop warning: %s", logs.String())
+	}
+	client.track.mu.Lock()
+	got := len(client.track.items)
+	client.track.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("%d items left after Close, want 0 (dropped)", got)
+	}
+}
+
+func TestPermanentRejectionIsNotAFlushFailure(t *testing.T) {
+	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		w.WriteHeader(http.StatusBadRequest)
+		return true
+	})
+	client := newTestClient(t, server.URL+"/")
+	defer func() { _ = client.Close() }()
+	if err := client.TrackEvent(context.Background(), Event{UserID: "user", Event: "bad"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v, want nil (delivered and rejected)", err)
 	}
 }

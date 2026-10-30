@@ -30,7 +30,7 @@ type config struct {
 	retryBaseDelay       time.Duration
 	retryJitterFraction  float64
 	maxTextFieldChars    int
-	closeTimeout         time.Duration
+	flushTimeout         time.Duration
 	appGit               appGitConfig
 }
 
@@ -53,7 +53,7 @@ func defaultConfig() config {
 		retryBaseDelay:       time.Second,
 		retryJitterFraction:  0.2,
 		maxTextFieldChars:    defaultMaxTextFieldChars,
-		closeTimeout:         defaultCloseTimeout,
+		flushTimeout:         defaultFlushTimeout,
 		appGit:               appGitConfig{enabled: true},
 	}
 }
@@ -227,17 +227,24 @@ func WithLibraryVersion(version string) Option {
 	}
 }
 
-// WithCloseTimeout sets the hard deadline for Close's final flush. A dead or
-// slow network must never wedge process exit: once the deadline passes,
-// in-flight sends are aborted and remaining payloads are dropped. Defaults
-// to 10s. Non-positive values are ignored.
-func WithCloseTimeout(timeout time.Duration) Option {
+// WithFlushTimeout sets the one deadline for Flush and Close (CONTRACT
+// 1.2.1). Flush returns at it with undelivered payloads still queued for the
+// background sender; Close drops whatever is left. Each request's timeout is
+// clamped to what remains of it. Defaults to 10s. Non-positive values are
+// ignored.
+func WithFlushTimeout(timeout time.Duration) Option {
 	return func(cfg *config) error {
 		if timeout > 0 {
-			cfg.closeTimeout = timeout
+			cfg.flushTimeout = timeout
 		}
 		return nil
 	}
+}
+
+// WithCloseTimeout is the former name of WithFlushTimeout: it sets the same
+// single deadline for Flush and Close.
+func WithCloseTimeout(timeout time.Duration) Option {
+	return WithFlushTimeout(timeout)
 }
 
 // WithMaxTextFieldChars sets the per-field cap (in bytes of UTF-8 text)

@@ -336,8 +336,8 @@ func TestWithCloseTimeoutValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newTestClient(t, "http://localhost:1/", WithCloseTimeout(tt.timeout))
 			defer func() { _ = client.Close() }()
-			if client.closeTimeout != tt.want {
-				t.Fatalf("closeTimeout = %s, want %s", client.closeTimeout, tt.want)
+			if client.flushTimeout != tt.want {
+				t.Fatalf("flushTimeout = %s, want %s", client.flushTimeout, tt.want)
 			}
 		})
 	}

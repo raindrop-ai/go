@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	driverVersion = "1.1.0"
+	driverVersion = "1.2.0"
 	protocolMajor = 1
 	sdkName       = "go"
 )
@@ -73,6 +73,12 @@ var (
 		// Interaction.Subagent and Client.ResumeSubagent (CONTRACT 13).
 		"subagents.detached_dispatch",
 		"subagents.detached_child",
+		// init.flush_timeout_ms -> WithFlushTimeout, the one Flush/Close
+		// deadline (CONTRACT 1.2.1).
+		"lifecycle.flush_timeout",
+		// `wait`: sleep without an SDK call, so background delivery is
+		// observable without an explicit flush.
+		"timing.wait",
 	}
 	notApplicable = []string{"wrapper.capture"}
 	// A not_applicable claim must argue "not fixable" (README policy).
@@ -254,6 +260,8 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 		return d.stepFlush(ctx)
 	case "close":
 		return d.stepClose()
+	case "wait":
+		return stepWait(args)
 	default:
 		return errUnsupported{step: name}
 	}
@@ -284,6 +292,13 @@ func (d *driver) stepInit(args map[string]any) error {
 	}
 	if appGitOption != nil {
 		opts = append(opts, appGitOption)
+	}
+	if raw, ok := args["flush_timeout_ms"]; ok {
+		ms, ok := raw.(float64)
+		if !ok || ms < 1 {
+			return fmt.Errorf("init: arg \"flush_timeout_ms\": expected a positive number of milliseconds, got %v", raw)
+		}
+		opts = append(opts, raindrop.WithFlushTimeout(time.Duration(ms)*time.Millisecond))
 	}
 	sink := strings.TrimRight(strings.TrimSpace(os.Getenv("RAINDROP_SINK_URL")), "/")
 	if sink == "" {
@@ -360,7 +375,7 @@ func (d *driver) stepFlush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return client.Flush(ctx)
+	return ignoreUndelivered(client.Flush(ctx))
 }
 
 func (d *driver) stepClose() error {
@@ -368,7 +383,27 @@ func (d *driver) stepClose() error {
 	if err != nil {
 		return err
 	}
-	return client.Close()
+	return ignoreUndelivered(client.Close())
+}
+
+// stepWait holds the process for args.ms milliseconds without an SDK call.
+func stepWait(args map[string]any) error {
+	ms, ok := args["ms"].(float64)
+	if !ok || ms <= 0 {
+		return fmt.Errorf("wait: arg \"ms\" must be a positive number, got %v", args["ms"])
+	}
+	time.Sleep(time.Duration(ms * float64(time.Millisecond)))
+	return nil
+}
+
+// ignoreUndelivered drops ErrUndelivered: it is safe to ignore by contract
+// (CONTRACT 1.2.1), the SDK has already warned, and the scenario asserts
+// what reached the wire. Any other error still fails the step.
+func ignoreUndelivered(err error) error {
+	if errors.Is(err, raindrop.ErrUndelivered) {
+		return nil
+	}
+	return err
 }
 
 // -- events ------------------------------------------------------------------

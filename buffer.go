@@ -2,7 +2,6 @@ package raindrop
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 )
@@ -270,6 +269,7 @@ func (b *eventBuffer) Flush(ctx context.Context) error {
 // Stop halts the background flusher and runs a final flush bounded by ctx.
 // An in-flight ticker flush is cancelled rather than awaited: its events are
 // restored to the buffer and re-sent here under the caller's deadline.
+// Whatever is still buffered when the deadline passes is dropped.
 func (b *eventBuffer) Stop(ctx context.Context) error {
 	b.stopOnce.Do(func() {
 		close(b.stopCh)
@@ -278,7 +278,16 @@ func (b *eventBuffer) Stop(ctx context.Context) error {
 	if b.ticker != nil {
 		<-b.doneCh
 	}
-	return b.Flush(ctx)
+	err := b.Flush(ctx)
+	b.mu.Lock()
+	left := len(b.buffers)
+	b.buffers = map[string]eventPatch{}
+	b.mu.Unlock()
+	if left > 0 {
+		b.client.warn("events.close_dropped",
+			"raindrop: close deadline passed; dropping interaction updates that were not sent", "events", left)
+	}
+	return err
 }
 
 func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
@@ -294,11 +303,18 @@ func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
 	}
 
 	if err := b.client.transport.postJSON(ctx, "events/track_partial", payload); err != nil {
-		var statusErr *httpStatusError
-		if errors.As(err, &statusErr) && !isRetryableStatus(statusErr.StatusCode) {
+		if isPermanentRejection(err) {
 			// Rejected for good (already warned): resending would fail the
 			// same way, so drop it rather than retry it on every flush.
 			return nil
+		}
+		if ctx.Err() != nil && !isUnsent(err) {
+			// Cut off mid-request at the deadline: it may already have
+			// reached ingest, so it is dropped rather than resent
+			// (CONTRACT 1.2.1).
+			b.client.warn("events.dropped",
+				"raindrop: an interaction update was cut off at the deadline; dropping it", "event_id", eventID)
+			return err
 		}
 		b.restore(eventID, patch)
 		return err
