@@ -46,12 +46,15 @@ func TestFanOutNoKeyNoLocalNoHTTP(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123", Traits: map[string]any{"plan": "paid"}}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	flushOrFail(t, client)
 	if err := client.TrackSignal(context.Background(), Signal{EventID: "evt", Name: "thumbs_up"}); err != nil {
 		t.Fatalf("track signal: %v", err)
 	}
+	flushOrFail(t, client)
 	if err := client.TrackAI(context.Background(), AIEvent{EventID: "evt", UserID: "user-123"}); err != nil {
 		t.Fatalf("track ai: %v", err)
 	}
+	flushOrFail(t, client)
 }
 
 func TestFanOutKeyOnlyShipsCloudOnly(t *testing.T) {
@@ -71,6 +74,7 @@ func TestFanOutKeyOnlyShipsCloudOnly(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123", Traits: map[string]any{"plan": "paid"}}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	flushOrFail(t, client)
 
 	if got := cloudCalls.Load(); got != 1 {
 		t.Fatalf("expected 1 cloud POST, got %d", got)
@@ -105,6 +109,7 @@ func TestFanOutKeyPlusLocalDualShips(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123", Traits: map[string]any{"plan": "paid"}}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	flushOrFail(t, client)
 
 	if got := cloudCalls.Load(); got != 1 {
 		t.Fatalf("expected 1 cloud POST, got %d", got)
@@ -141,9 +146,11 @@ func TestFanOutLocalOnlyWhenNoKey(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123", Traits: map[string]any{"plan": "paid"}}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	flushOrFail(t, client)
 	if err := client.TrackSignal(context.Background(), Signal{EventID: "evt", Name: "thumbs_up"}); err != nil {
 		t.Fatalf("track signal: %v", err)
 	}
+	flushOrFail(t, client)
 
 	localMu.Lock()
 	defer localMu.Unlock()
@@ -187,6 +194,7 @@ func TestFanOutLocalFailureDoesNotBreakCloud(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123", Traits: map[string]any{"plan": "paid"}}); err != nil {
 		t.Fatalf("identify with broken local mirror should not bubble: %v", err)
 	}
+	flushOrFail(t, client)
 	if got := cloudCalls.Load(); got != 1 {
 		t.Fatalf("expected cloud POST to still succeed, got %d", got)
 	}
@@ -217,6 +225,7 @@ func TestFanOutLocalReturns500DoesNotBreakCloud(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123"}); err != nil {
 		t.Fatalf("identify with failing local mirror should not bubble: %v", err)
 	}
+	flushOrFail(t, client)
 	if got := cloudCalls.Load(); got != 1 {
 		t.Fatalf("expected 1 cloud POST, got %d", got)
 	}

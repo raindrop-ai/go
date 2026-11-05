@@ -69,6 +69,10 @@ func exerciseEveryRequestSite(t *testing.T, client *Client) {
 	if err := client.Identify(ctx, User{UserID: "user-123", Traits: map[string]any{"plan": "paid"}}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	interaction := client.Begin(ctx, BeginOptions{EventID: "evt_project_partial", UserID: "user-123", Input: "hello"})
+	if err := interaction.Finish(FinishOptions{Output: "hi"}); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
 
 	span := client.StartSpan(ctx, SpanOptions{Name: "llm_call", EventID: "evt_project"})
 	span.SetAttributes(StringAttr("ai.model.id", "gpt-4o"))
@@ -126,6 +130,7 @@ func TestProjectIDHeaderAttachedToEveryRequestWhenValid(t *testing.T) {
 
 	records := snapshot()
 	wantPaths := map[string]bool{
+		"/events/track":         false,
 		"/events/track_partial": false,
 		"/signals/track":        false,
 		"/users/identify":       false,
@@ -176,6 +181,7 @@ func TestProjectIDHeaderTrimsSurroundingWhitespace(t *testing.T) {
 	if err := client.TrackSignal(context.Background(), Signal{EventID: "evt", Name: "thumbs_up"}); err != nil {
 		t.Fatalf("track signal: %v", err)
 	}
+	flushOrFail(t, client)
 
 	records := snapshot()
 	if len(records) != 1 {
@@ -202,6 +208,7 @@ func TestProjectIDHeaderOmittedAndWarnedWhenInvalid(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123"}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	flushOrFail(t, client)
 
 	records := snapshot()
 	if len(records) != 1 {
@@ -247,6 +254,7 @@ func TestProjectIDHeaderAttachedToLocalMirror(t *testing.T) {
 	if err := client.Identify(context.Background(), User{UserID: "user-123"}); err != nil {
 		t.Fatalf("identify: %v", err)
 	}
+	flushOrFail(t, client)
 
 	for _, tc := range []struct {
 		name     string

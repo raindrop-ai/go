@@ -47,11 +47,14 @@ func TestDriverAppGitUsesPublicSDKOption(t *testing.T) {
 		Properties map[string]any `json:"properties"`
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/events/track_partial" {
+		if r.URL.Path != "/v1/events/track" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Errorf("decode payload: %v", err)
+		var batch []json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil || len(batch) != 1 {
+			t.Errorf("decode payload: %v (%d items)", err, len(batch))
+		} else if err := json.Unmarshal(batch[0], &payload); err != nil {
+			t.Errorf("decode event: %v", err)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -73,6 +76,9 @@ func TestDriverAppGitUsesPublicSDKOption(t *testing.T) {
 		"user_id":  "driver-user",
 	}); err != nil {
 		t.Fatalf("track: %v", err)
+	}
+	if err := d.client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 	if got := payload.Properties["raindrop.app.commit_sha"]; got != commit {
 		t.Fatalf("commit = %#v", got)

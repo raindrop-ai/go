@@ -43,18 +43,22 @@ func cloneAttachments(src []Attachment) []Attachment {
 	return dst
 }
 
+// timestampLayout is ISO-8601 UTC with milliseconds, the form every SDK
+// sends, so a caller's millisecond timestamp goes out unchanged (CONTRACT 9.1).
+const timestampLayout = "2006-01-02T15:04:05.000Z07:00"
+
 func iso8601Timestamp(at time.Time) string {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	return at.UTC().Format(time.RFC3339Nano)
+	return at.UTC().Format(timestampLayout)
 }
 
 func optionalTimestamp(at time.Time) string {
 	if at.IsZero() {
 		return ""
 	}
-	return at.UTC().Format(time.RFC3339Nano)
+	return at.UTC().Format(timestampLayout)
 }
 
 func newEventID() (string, error) {

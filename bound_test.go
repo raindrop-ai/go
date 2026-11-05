@@ -252,9 +252,8 @@ func TestEventTextFieldsCappedBeforeSend(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var received trackPartialPayload
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, _ := io.ReadAll(r.Body)
-				if err := json.Unmarshal(body, &received); err != nil {
-					t.Errorf("unmarshal payload: %v", err)
+				if payloads := decodeEventPayloads(t, r.Body); len(payloads) > 0 {
+					received = payloads[len(payloads)-1]
 				}
 				w.WriteHeader(http.StatusNoContent)
 			}))
@@ -264,6 +263,9 @@ func TestEventTextFieldsCappedBeforeSend(t *testing.T) {
 			defer func() { _ = client.Close() }()
 
 			tt.send(t, client)
+			if err := client.Flush(context.Background()); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
 
 			if received.AIData == nil {
 				t.Fatalf("missing ai_data: %#v", received)
@@ -337,9 +339,8 @@ func TestEventPropertiesAndAttachmentsCappedBeforeSend(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var received trackPartialPayload
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, _ := io.ReadAll(r.Body)
-				if err := json.Unmarshal(body, &received); err != nil {
-					t.Errorf("unmarshal payload: %v", err)
+				if payloads := decodeEventPayloads(t, r.Body); len(payloads) > 0 {
+					received = payloads[len(payloads)-1]
 				}
 				w.WriteHeader(http.StatusNoContent)
 			}))
@@ -349,6 +350,9 @@ func TestEventPropertiesAndAttachmentsCappedBeforeSend(t *testing.T) {
 			defer func() { _ = client.Close() }()
 
 			tt.send(t, client)
+			if err := client.Flush(context.Background()); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
 
 			transcript, _ := received.Properties["transcript"].(string)
 			if len(transcript) > limit {

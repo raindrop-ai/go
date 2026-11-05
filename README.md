@@ -28,9 +28,9 @@ client, err := raindrop.New(
 ```
 
 All outbound HTTP carries finite deadlines — even when a custom
-`WithHTTPClient` has no `Timeout` — and `Close()` runs its final flush under
-a hard deadline (`WithCloseTimeout`, default 10s) so a dead network can
-never wedge your process exit.
+`WithHTTPClient` has no `Timeout` — and `Flush()` and `Close()` share one
+deadline (`WithFlushTimeout`, default 10s) so a dead network can never wedge
+your process exit.
 
 ## Quick Start: Interaction API
 
@@ -107,21 +107,30 @@ _ = interaction.AddAttachments([]raindrop.Attachment{{
 
 ### Resuming An Interaction
 
-`ResumeInteraction()` is only for recovering an active in-memory interaction created by `Begin()` in the same process. It is not a cross-process restore mechanism.
+`Resume()` continues an event begun elsewhere (another process, a queue worker, a later request) using only its id. Later `Patch` and `Finish` calls are sent even without a user id and carry only the fields they supply, so ingest keeps the user, conversation, name and start time it already stored. Pass `ResumeOptions` to attach identity you know. `ResumeInteraction(id)` returns the open interaction when it was begun in this process, and otherwise behaves like `Resume` with no options.
 
 ```go
-interaction := client.Begin(ctx, raindrop.BeginOptions{
-	EventID: "evt_123",
-	UserID:  "user-123",
-	Event:   "chat_message",
-	Input:   "Can you suggest a morning plan?",
-})
-
-resumed := client.ResumeInteraction("evt_123")
+resumed := client.Resume("evt_123", raindrop.ResumeOptions{})
 _ = resumed.SetProperty("stage", "follow-up")
 _ = resumed.Finish(raindrop.FinishOptions{
 	Output: "Here is a shorter version of that itinerary.",
 })
+```
+
+### Detached Sub-Agents
+
+A detached sub-agent runs as its own event, possibly in another process. The launcher records the dispatch and passes the returned headers to the child; the child opens its own event from them, and every span it records links back to the launcher.
+
+```go
+dispatch := interaction.Subagent(raindrop.SubagentOptions{
+	Name:  "researcher",
+	Input: "find sources on topic X",
+})
+// Send dispatch.ChildEventID and dispatch.Headers with the job.
+
+// In the worker:
+run := client.ResumeSubagent(ctx, headers, raindrop.ResumeSubagentOptions{})
+_ = run.Finish(raindrop.FinishOptions{Output: "Found 3 sources."})
 ```
 
 ## Single-Shot Tracking
@@ -140,6 +149,8 @@ _ = client.TrackAI(ctx, raindrop.AIEvent{
 	},
 })
 ```
+
+`TrackAI()` and `TrackEvent()` only queue the event: they never do network I/O on the calling goroutine. Events are sent in batches by a background goroutine, or by `Flush()` / `Close()`. An event without a `UserID` is not sent and is logged as a warning.
 
 Use `TrackEvent()` for non-AI events:
 
@@ -166,6 +177,20 @@ _, _ = raindrop.WithTool(interaction, "coffee_search", raindrop.ToolOptions{
 	Input: map[string]any{"query": "best coffee near Dolores Park"},
 }, func() (map[string]any, error) {
 	return map[string]any{"winner": "Ritual Coffee Roasters"}, nil
+})
+```
+
+Record a tool call after the fact with `TrackTool`: give `StartTime` plus `Duration` or `EndTime` (`EndTime` wins when both are set). `ParentContext` places the span under a span another process saved (W3C ids, lowercase hex):
+
+```go
+interaction.TrackTool(raindrop.TrackToolOptions{
+	Name:      "web_search",
+	StartTime: startedAt,
+	Duration:  1500 * time.Millisecond,
+	ParentContext: &raindrop.SpanContext{
+		TraceID: savedTraceID,
+		SpanID:  savedSpanID,
+	},
 })
 ```
 
@@ -248,7 +273,8 @@ tracer.TrackTool(raindrop.TrackToolOptions{
 - `WithServiceVersion(string)`: Overrides the OTLP service version and default library version.
 - `WithLibraryVersion(string)`: Overrides the `$context.library.version` event metadata.
 - `WithMaxTextFieldChars(int)`: Sets the per-field byte cap applied to event input/output, event property and attachment values, and serialized tool span content before serialization. Defaults to `1000000`. Non-positive values are ignored.
-- `WithCloseTimeout(time.Duration)`: Sets the hard deadline for `Close()`'s final flush; once it passes, in-flight sends are aborted and remaining payloads are dropped. Defaults to `10s`. Non-positive values are ignored.
+- `WithFlushTimeout(time.Duration)`: Sets the one deadline for `Flush()` and `Close()`, which each request's timeout is clamped to. Defaults to `10s`. Non-positive values are ignored.
+- `WithCloseTimeout(time.Duration)`: The former name of `WithFlushTimeout`; sets the same deadline.
 - `WithLogger(*slog.Logger)`: Uses a custom structured logger.
 - `WithAppGit(AppGitOptions)`: Configures application Git provenance and automatic discovery.
 - `WithAppGitDisabled()`: Disables client-level Git provenance enrichment.
@@ -345,14 +371,18 @@ The local POST uses a 2s timeout, no retries, and errors are logged at `debug` l
 
 ## Behavior
 
-- Events are sent to `/events/track_partial`.
+- `TrackAI()`, `TrackEvent()`, `TrackSignal()` and `Identify()` queue their payload and return immediately. Complete events are sent in batches to `/events/track`, signals to `/signals/track`, and identify calls to `/users/identify`.
+- `Begin()`/`Patch()`/`Finish()` events are sent to `/events/track_partial`. Every request for an event carries its start time: the `Timestamp` passed to `Begin()`, else the time `Begin()` was called. A later timestamp only replaces it when earlier.
 - Finalized events always send `is_pending=false`.
-- Signal payloads go to `/signals/track`.
-- User identify payloads go to `/users/identify`.
+- `Flush()` returns once everything queued before it, including sends already in progress, was handed to the API, bounded by `WithFlushTimeout` when the context has no deadline. When the deadline passes first, payloads that were not sent yet, or were waiting on a retry or `Retry-After`, stay queued for the background sender; a request cut off mid-flight is dropped, since it may already have reached the API.
+- `Close()` does the same under the same deadline, stops the background goroutines, and drops whatever is still unsent when the deadline passes.
+- When either returns with something undelivered, it logs a warning and returns an error wrapping `raindrop.ErrUndelivered`. The error is safe to ignore: log it if you like, but don't treat it as a failure of your own work. A payload the API rejected permanently was delivered, so it isn't reported there.
+- 408, 429 and 5xx responses are retried, waiting at least the `Retry-After` the server sends (capped at 30s); a 429 or 503 with `Retry-After` pauses every send to the API for that time. Any other 4xx is a permanent rejection: the payload is dropped with a warning and never retried.
+- When the API accepts a request but lists `rejected` items or `warnings` in its response, they are logged as warnings.
 - Traces are sent as OTLP JSON to `/traces`.
 - When `WithProjectID` is set to a valid slug, every outbound request carries the `X-Raindrop-Project-Id` header; otherwise the header is omitted.
 - `Begin()`/`Finish()` is the recommended flow for new code.
-- `ResumeInteraction()` is only for recovering an active interaction handle in the same process.
+- Warnings (dropped payloads, events without a user, empty or repeated finishes) are logged at `Warn` through the configured logger, rate-limited, regardless of `WithDebug`.
 - Empty `writeKey` with no local Workshop URL resolved disables all shipping without raising errors.
 
 ## Versioning

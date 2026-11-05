@@ -39,11 +39,7 @@ func unsetEnvironment(t *testing.T, keys ...string) {
 func TestConfiguredAppGitEnrichesEventsWithoutOverwritingCaller(t *testing.T) {
 	var received []trackPartialPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload trackPartialPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Errorf("decode payload: %v", err)
-		}
-		received = append(received, payload)
+		received = append(received, decodeEventPayloads(t, r.Body)...)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -70,6 +66,9 @@ func TestConfiguredAppGitEnrichesEventsWithoutOverwritingCaller(t *testing.T) {
 		},
 	}); err != nil {
 		t.Fatalf("track explicit event: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	if len(received) != 2 {
@@ -98,9 +97,7 @@ func TestConfiguredAppGitEnrichesEventsWithoutOverwritingCaller(t *testing.T) {
 func TestInteractionFreezesEmptyAppGitSnapshot(t *testing.T) {
 	var received []trackPartialPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload trackPartialPayload
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		received = append(received, payload)
+		received = append(received, decodeEventPayloads(t, r.Body)...)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -114,6 +111,9 @@ func TestInteractionFreezesEmptyAppGitSnapshot(t *testing.T) {
 	}
 	if err := client.TrackEvent(context.Background(), Event{EventID: "later", UserID: "user"}); err != nil {
 		t.Fatalf("track later event: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	if _, exists := received[0].Properties[appCommitSHAProperty]; exists {
@@ -438,7 +438,9 @@ func TestExplicitSourceDirectoryBeatsAmbientDeploymentAndCI(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var received trackPartialPayload
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_ = json.NewDecoder(r.Body).Decode(&received)
+				if payloads := decodeEventPayloads(t, r.Body); len(payloads) > 0 {
+					received = payloads[0]
+				}
 				w.WriteHeader(http.StatusNoContent)
 			}))
 			defer server.Close()
@@ -451,6 +453,7 @@ func TestExplicitSourceDirectoryBeatsAmbientDeploymentAndCI(t *testing.T) {
 			if err := client.TrackEvent(context.Background(), Event{EventID: "selected-aut", UserID: "user"}); err != nil {
 				t.Fatal(err)
 			}
+			flushOrFail(t, client)
 			if got := received.Properties[appCommitSHAProperty]; got != autSHA {
 				t.Fatalf("selected AUT commit = %#v, observer = %s", got, observerSHA)
 			}
@@ -553,9 +556,7 @@ func TestLocalRevisionSurvivesUnavailableStatus(t *testing.T) {
 func TestDirectPatchSnapshotSurvivesFlushFinishAndResume(t *testing.T) {
 	var received []trackPartialPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload trackPartialPayload
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		received = append(received, payload)
+		received = append(received, decodeEventPayloads(t, r.Body)...)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
