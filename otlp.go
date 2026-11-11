@@ -3,6 +3,8 @@ package raindrop
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 	"strconv"
 	"time"
 )
@@ -133,6 +135,23 @@ func createSpanIDs(parent *Span) (spanIDs, error) {
 	if parent != nil {
 		ids.ParentSpanIDB64 = parent.ids.SpanIDB64
 	}
+	return ids, nil
+}
+
+// spanIDsUnder re-parents fresh span ids under a saved parent: its trace id
+// and its span id as the parent. Invalid ids are rejected so a malformed
+// saved context never ships a span nobody can attach.
+func spanIDsUnder(parent SpanContext, ids spanIDs) (spanIDs, error) {
+	traceID, err := hex.DecodeString(parent.TraceID)
+	if err != nil || len(traceID) != 16 {
+		return spanIDs{}, fmt.Errorf("raindrop: parent trace id %q is not 32 hex characters", parent.TraceID)
+	}
+	spanID, err := hex.DecodeString(parent.SpanID)
+	if err != nil || len(spanID) != 8 {
+		return spanIDs{}, fmt.Errorf("raindrop: parent span id %q is not 16 hex characters", parent.SpanID)
+	}
+	ids.TraceIDB64 = base64.StdEncoding.EncodeToString(traceID)
+	ids.ParentSpanIDB64 = base64.StdEncoding.EncodeToString(spanID)
 	return ids, nil
 }
 

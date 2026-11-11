@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -35,7 +36,7 @@ import (
 )
 
 const (
-	driverVersion = "1.0.0"
+	driverVersion = "1.2.0"
 	protocolMajor = 1
 	sdkName       = "go"
 )
@@ -50,17 +51,34 @@ var (
 		"app_git.contextual_auto_detection",
 		"events.track",
 		"events.track_ai",
-		// Factually true delivery mode: TrackEvent/TrackAI ship begin-style
-		// to events/track_partial (DEV-1149) — declaring it runs the
-		// wrap-*-partial scenarios against the route this SDK actually uses.
-		"events.track_ai_partial",
 		"events.track_partial",
+		// Resume an event begun elsewhere by id (Client.Resume, CONTRACT 9.2).
+		"events.resume",
+		// The Go API takes an empty UserID, so an omitted user_id reaches the
+		// SDK as "" and its own handling is what the wire shows (CONTRACT 10.1).
+		"events.optional_user_id",
 		"app_git.config",
 		"identify",
 		// `signal` maps to the public Client.TrackSignal surface (DEV-1201:
 		// the capability went active once signal UUIDs populate on Query API
 		// reads; signal scenarios are experimental until promoted).
 		"signal",
+		// SDK warnings go to RAINDROP_HARNESS_LOG through a slog handler
+		// (CONTRACT 14).
+		"logs.capture",
+		// Interaction.TrackTool with StartTime/EndTime/Duration and a saved
+		// ParentContext (CONTRACT 12).
+		"traces.retroactive_span",
+		"traces.span_parent",
+		// Interaction.Subagent and Client.ResumeSubagent (CONTRACT 13).
+		"subagents.detached_dispatch",
+		"subagents.detached_child",
+		// init.flush_timeout_ms -> WithFlushTimeout, the one Flush/Close
+		// deadline (CONTRACT 1.2.1).
+		"lifecycle.flush_timeout",
+		// `wait`: sleep without an SDK call, so background delivery is
+		// observable without an explicit flush.
+		"timing.wait",
 	}
 	notApplicable = []string{"wrapper.capture"}
 	// A not_applicable claim must argue "not fixable" (README policy).
@@ -96,6 +114,8 @@ type timingLine struct {
 type driver struct {
 	client      *raindrop.Client
 	interaction *raindrop.Interaction
+	// carriers holds dispatch_subagent carriers by child event id.
+	carriers map[string]map[string]string
 }
 
 // cleanArgs drops the reserved `max_ms` timing arg (handled by the runner,
@@ -224,6 +244,14 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 		return d.stepPatch(args)
 	case "finish":
 		return d.stepFinish(args)
+	case "resume":
+		return d.stepResume(args)
+	case "track_tool":
+		return d.stepTrackTool(args)
+	case "dispatch_subagent":
+		return d.stepDispatchSubagent(args)
+	case "run_subagent":
+		return d.stepRunSubagent(ctx, args)
 	case "identify":
 		return d.stepIdentify(ctx, args)
 	case "signal":
@@ -232,6 +260,8 @@ func (d *driver) execute(ctx context.Context, name string, args map[string]any) 
 		return d.stepFlush(ctx)
 	case "close":
 		return d.stepClose()
+	case "wait":
+		return stepWait(args)
 	default:
 		return errUnsupported{step: name}
 	}
@@ -250,6 +280,7 @@ func (d *driver) stepInit(args map[string]any) error {
 		return errors.New("init: RAINDROP_WRITE_KEY is required: an empty key builds a disabled client and the run becomes a silent no-op")
 	}
 	opts := []raindrop.Option{
+		raindrop.WithLogger(harnessLogger()),
 		raindrop.WithWriteKey(writeKey),
 		// The harness measures the SDK↔sink exchange alone; a locally running
 		// Workshop daemon must not be probed or dual-shipped to.
@@ -261,6 +292,13 @@ func (d *driver) stepInit(args map[string]any) error {
 	}
 	if appGitOption != nil {
 		opts = append(opts, appGitOption)
+	}
+	if raw, ok := args["flush_timeout_ms"]; ok {
+		ms, ok := raw.(float64)
+		if !ok || ms < 1 {
+			return fmt.Errorf("init: arg \"flush_timeout_ms\": expected a positive number of milliseconds, got %v", raw)
+		}
+		opts = append(opts, raindrop.WithFlushTimeout(time.Duration(ms)*time.Millisecond))
 	}
 	sink := strings.TrimRight(strings.TrimSpace(os.Getenv("RAINDROP_SINK_URL")), "/")
 	if sink == "" {
@@ -337,7 +375,7 @@ func (d *driver) stepFlush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return client.Flush(ctx)
+	return ignoreUndelivered(client.Flush(ctx))
 }
 
 func (d *driver) stepClose() error {
@@ -345,7 +383,27 @@ func (d *driver) stepClose() error {
 	if err != nil {
 		return err
 	}
-	return client.Close()
+	return ignoreUndelivered(client.Close())
+}
+
+// stepWait holds the process for args.ms milliseconds without an SDK call.
+func stepWait(args map[string]any) error {
+	ms, ok := args["ms"].(float64)
+	if !ok || ms <= 0 {
+		return fmt.Errorf("wait: arg \"ms\" must be a positive number, got %v", args["ms"])
+	}
+	time.Sleep(time.Duration(ms * float64(time.Millisecond)))
+	return nil
+}
+
+// ignoreUndelivered drops ErrUndelivered: it is safe to ignore by contract
+// (CONTRACT 1.2.1), the SDK has already warned, and the scenario asserts
+// what reached the wire. Any other error still fails the step.
+func ignoreUndelivered(err error) error {
+	if errors.Is(err, raindrop.ErrUndelivered) {
+		return nil
+	}
+	return err
 }
 
 // -- events ------------------------------------------------------------------
@@ -462,12 +520,11 @@ func (d *driver) stepSignal(ctx context.Context, args map[string]any) error {
 	} else if v != "" {
 		sig.AttachmentID = v
 	}
-	// The public Signal struct carries no comment/after fields — refuse
-	// loudly rather than silently drop (fleet non-negotiable).
-	for _, unmappable := range []string{"comment", "after"} {
-		if _, present := args[unmappable]; present {
-			return fmt.Errorf("signal: arg %q is not mappable onto the public TrackSignal surface", unmappable)
-		}
+	if sig.Comment, err = stringArg(args, "comment"); err != nil {
+		return err
+	}
+	if sig.After, err = stringArg(args, "after"); err != nil {
+		return err
 	}
 	return client.TrackSignal(ctx, sig)
 }
@@ -539,6 +596,211 @@ func (d *driver) stepFinish(args map[string]any) error {
 	d.interaction = nil
 	return err
 }
+
+func (d *driver) stepResume(args map[string]any) error {
+	client, err := d.requireClient()
+	if err != nil {
+		return err
+	}
+	if d.interaction != nil {
+		return fmt.Errorf("resume: an interaction is already open")
+	}
+	event, err := eventFields(args)
+	if err != nil {
+		return err
+	}
+	if event.eventID == "" {
+		return fmt.Errorf("resume: missing required arg \"event_id\"")
+	}
+	// CONTRACT 9.2: bind to an event begun elsewhere by id. Nothing is sent
+	// now; later patch/finish carry only what they (or this step) supply.
+	d.interaction = client.Resume(event.eventID, raindrop.ResumeOptions{
+		UserID:  event.userID,
+		ConvoID: event.convoID,
+		Event:   event.event,
+	})
+	return nil
+}
+
+func (d *driver) stepTrackTool(args map[string]any) error {
+	if d.interaction == nil {
+		return fmt.Errorf("track_tool: no open interaction")
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return err
+	}
+	opts := raindrop.TrackToolOptions{Name: name}
+	if value, present := args["input"]; present {
+		opts.Input = value
+	}
+	if value, present := args["output"]; present {
+		opts.Output = value
+	}
+	if message, err := stringArg(args, "error"); err != nil {
+		return err
+	} else if message != "" {
+		opts.Error = errors.New(message)
+	}
+	for key, destination := range map[string]*time.Time{"start_time": &opts.StartTime, "end_time": &opts.EndTime} {
+		raw, err := stringArg(args, key)
+		if err != nil {
+			return err
+		}
+		if raw == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return fmt.Errorf("track_tool: arg %q is not RFC3339: %w", key, err)
+		}
+		*destination = parsed
+	}
+	if value, present := args["duration_ms"]; present {
+		ms, ok := value.(float64)
+		if !ok {
+			return fmt.Errorf("track_tool: arg \"duration_ms\" must be a number, got %T", value)
+		}
+		opts.Duration = time.Duration(ms * float64(time.Millisecond))
+	}
+	if parent, err := objectArg(args, "parent"); err != nil {
+		return err
+	} else if parent != nil {
+		traceID, _ := parent["trace_id"].(string)
+		spanID, _ := parent["span_id"].(string)
+		opts.ParentContext = &raindrop.SpanContext{TraceID: traceID, SpanID: spanID}
+	}
+	d.interaction.TrackTool(opts)
+	return nil
+}
+
+func (d *driver) stepDispatchSubagent(args map[string]any) error {
+	if d.interaction == nil {
+		return fmt.Errorf("dispatch_subagent: no open interaction")
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return err
+	}
+	childEventID, err := stringArg(args, "child_event_id")
+	if err != nil {
+		return err
+	}
+	opts := raindrop.SubagentOptions{Name: name, ChildEventID: childEventID}
+	if value, present := args["input"]; present {
+		opts.Input = value
+	}
+	dispatch := d.interaction.Subagent(opts)
+	if d.carriers == nil {
+		d.carriers = make(map[string]map[string]string)
+	}
+	d.carriers[childEventID] = dispatch.Headers
+	return nil
+}
+
+func (d *driver) stepRunSubagent(ctx context.Context, args map[string]any) error {
+	client, err := d.requireClient()
+	if err != nil {
+		return err
+	}
+	if d.interaction != nil {
+		return fmt.Errorf("run_subagent: the client has an open interaction")
+	}
+	var headers map[string]string
+	if source, err := stringArg(args, "carrier_from"); err != nil {
+		return err
+	} else if source != "" {
+		var ok bool
+		if headers, ok = d.carriers[source]; !ok {
+			return fmt.Errorf("run_subagent: no carrier was dispatched for %q", source)
+		}
+	} else {
+		raw, err := objectArg(args, "headers")
+		if err != nil {
+			return err
+		}
+		headers = make(map[string]string, len(raw))
+		for key, value := range raw {
+			text, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("run_subagent: header %q must be a string", key)
+			}
+			headers[key] = text
+		}
+	}
+	userID, err := stringArg(args, "user_id")
+	if err != nil {
+		return err
+	}
+	output, err := stringArg(args, "output")
+	if err != nil {
+		return err
+	}
+	run := client.ResumeSubagent(ctx, headers, raindrop.ResumeSubagentOptions{UserID: userID})
+	if toolName, err := stringArg(args, "tool_name"); err != nil {
+		return err
+	} else if toolName != "" {
+		// The child's work: one tool span while the run is open, which
+		// carries the hand-off link back to the launcher.
+		run.Interaction.TrackTool(raindrop.TrackToolOptions{Name: toolName, Duration: time.Millisecond})
+	}
+	return run.Finish(raindrop.FinishOptions{Output: output})
+}
+
+// harnessLogger writes SDK log records to RAINDROP_HARNESS_LOG as JSON lines
+// ({"level", "message"}) for the runner (CONTRACT 14). Without the variable
+// the SDK logs nowhere, keeping the driver's stdout protocol clean.
+func harnessLogger() *slog.Logger {
+	path := os.Getenv("RAINDROP_HARNESS_LOG")
+	if path == "" {
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return slog.New(&harnessLogHandler{path: path})
+}
+
+type harnessLogHandler struct {
+	path  string
+	attrs []slog.Attr
+}
+
+func (h *harnessLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *harnessLogHandler) Handle(_ context.Context, record slog.Record) error {
+	level := "info"
+	switch {
+	case record.Level >= slog.LevelError:
+		level = "error"
+	case record.Level >= slog.LevelWarn:
+		level = "warn"
+	case record.Level < slog.LevelInfo:
+		level = "debug"
+	}
+	message := record.Message
+	for _, attr := range h.attrs {
+		message += " " + attr.String()
+	}
+	record.Attrs(func(attr slog.Attr) bool {
+		message += " " + attr.String()
+		return true
+	})
+	line, err := json.Marshal(map[string]string{"level": level, "message": message})
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(h.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(append(line, '\n'))
+	return err
+}
+
+func (h *harnessLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &harnessLogHandler{path: h.path, attrs: append(append([]slog.Attr{}, h.attrs...), attrs...)}
+}
+
+func (h *harnessLogHandler) WithGroup(string) slog.Handler { return h }
 
 // eventArgs is the union of the harness's event-shaped step args; each step
 // handler forwards only the fields its SDK call accepts.

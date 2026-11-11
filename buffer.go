@@ -26,7 +26,21 @@ type stickyEventData struct {
 	ConvoID   string
 	IsPending *bool
 	AppGit    *appGitSnapshot
+
+	// StartedAt is the event's start (CONTRACT 9.1), sent unchanged on every
+	// request: the caller's timestamp, else the clock when the event was
+	// begun here. A later timestamp only replaces it when earlier.
+	StartedAt time.Time
+	// Resumed marks an event continued by id from elsewhere: its updates go
+	// out without a user or default name, and it gets no clock start.
+	Resumed bool
+	// HadContent records input, output or attachments seen in this process.
+	HadContent bool
 }
+
+// maxFinishedEventMemory bounds the record of events finished in this
+// process, used only to warn about a repeated finish.
+const maxFinishedEventMemory = 10_000
 
 type eventBuffer struct {
 	client *Client
@@ -34,6 +48,14 @@ type eventBuffer struct {
 	mu      sync.Mutex
 	buffers map[string]eventPatch
 	sticky  map[string]stickyEventData
+
+	finished      map[string]struct{}
+	finishedOrder []string
+
+	// sendSem admits one send at a time, so Flush waits for a ticker send in
+	// flight instead of returning while that event is neither buffered nor
+	// delivered (CONTRACT 1.2).
+	sendSem chan struct{}
 
 	ticker   *time.Ticker
 	stopOnce sync.Once
@@ -54,6 +76,8 @@ func newEventBuffer(client *Client, flushEvery time.Duration) *eventBuffer {
 		client:    client,
 		buffers:   make(map[string]eventPatch),
 		sticky:    make(map[string]stickyEventData),
+		finished:  make(map[string]struct{}),
+		sendSem:   make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 		runCtx:    runCtx,
@@ -109,18 +133,123 @@ func (b *eventBuffer) Patch(ctx context.Context, eventID string, patch eventPatc
 		}
 	}
 
+	nextSticky := mergeStickyEventData(sticky, merged)
+	nextSticky.StartedAt = eventStart(sticky, patch.Timestamp)
+	if patch.Input != "" || patch.Output != "" || len(patch.Attachments) > 0 {
+		nextSticky.HadContent = true
+	}
 	b.buffers[eventID] = merged
-	b.sticky[eventID] = mergeStickyEventData(sticky, merged)
+	b.sticky[eventID] = nextSticky
+	finishing := patch.IsPending != nil && !*patch.IsPending
+	_, finishedBefore := b.finished[eventID]
+	if finishing {
+		b.rememberFinished(eventID)
+	}
 	flushNow := merged.IsPending != nil && !*merged.IsPending
 	b.mu.Unlock()
 
+	if finishing && b.client != nil {
+		switch {
+		case finishedBefore:
+			// Still sent: ingest handles a repeated finish (CONTRACT 10.2), but
+			// two finishes usually mean two interactions share an event id.
+			b.client.warn("partial.repeated_finish",
+				"raindrop: event was already finished in this process; sending the update anyway",
+				"event_id", eventID)
+		case !nextSticky.HadContent && !nextSticky.Resumed:
+			// Still sent: whether an empty event is kept is ingest's call
+			// (CONTRACT 14.2). A resumed event is exempt, since another
+			// process may have sent its content.
+			b.client.warn("partial.empty_finish",
+				"raindrop: event finished with no input, output or attachments; sending it anyway",
+				"event_id", eventID)
+		}
+	}
+
 	if flushNow {
+		if err := b.acquire(ctx); err != nil {
+			return err
+		}
+		defer b.release()
 		return b.flushOne(ctx, eventID)
 	}
 	return nil
 }
 
+func (b *eventBuffer) acquire(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case b.sendSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *eventBuffer) release() { <-b.sendSem }
+
+// eventStart keeps an event's start: the first value wins, a later explicit
+// timestamp only moves it earlier, and a resumed event gets no clock start.
+func eventStart(sticky stickyEventData, timestamp time.Time) time.Time {
+	switch {
+	case !timestamp.IsZero() && (sticky.StartedAt.IsZero() || timestamp.Before(sticky.StartedAt)):
+		return timestamp
+	case sticky.StartedAt.IsZero() && !sticky.Resumed:
+		return time.Now().UTC()
+	default:
+		return sticky.StartedAt
+	}
+}
+
+func (b *eventBuffer) rememberFinished(eventID string) {
+	if _, ok := b.finished[eventID]; ok {
+		return
+	}
+	if len(b.finishedOrder) >= maxFinishedEventMemory {
+		delete(b.finished, b.finishedOrder[0])
+		b.finishedOrder = b.finishedOrder[1:]
+	}
+	b.finished[eventID] = struct{}{}
+	b.finishedOrder = append(b.finishedOrder, eventID)
+}
+
+// stickyFor returns what is known about an event's identity in this process.
+func (b *eventBuffer) stickyFor(eventID string) (stickyEventData, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	sticky, ok := b.sticky[eventID]
+	return sticky, ok
+}
+
+// markResumed records an event continued by id, with any identity the
+// caller supplied. It changes nothing for an event already known here.
+func (b *eventBuffer) markResumed(eventID string, opts ResumeOptions) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	sticky, known := b.sticky[eventID]
+	if known && !sticky.Resumed {
+		return
+	}
+	sticky.Resumed = true
+	if opts.UserID != "" {
+		sticky.UserID = opts.UserID
+	}
+	if opts.ConvoID != "" {
+		sticky.ConvoID = opts.ConvoID
+	}
+	if opts.Event != "" {
+		sticky.EventName = opts.Event
+	}
+	b.sticky[eventID] = sticky
+}
+
 func (b *eventBuffer) Flush(ctx context.Context) error {
+	if err := b.acquire(ctx); err != nil {
+		return err
+	}
+	defer b.release()
 	b.mu.Lock()
 	ids := make([]string, 0, len(b.buffers))
 	for eventID := range b.buffers {
@@ -140,6 +269,7 @@ func (b *eventBuffer) Flush(ctx context.Context) error {
 // Stop halts the background flusher and runs a final flush bounded by ctx.
 // An in-flight ticker flush is cancelled rather than awaited: its events are
 // restored to the buffer and re-sent here under the caller's deadline.
+// Whatever is still buffered when the deadline passes is dropped.
 func (b *eventBuffer) Stop(ctx context.Context) error {
 	b.stopOnce.Do(func() {
 		close(b.stopCh)
@@ -148,7 +278,16 @@ func (b *eventBuffer) Stop(ctx context.Context) error {
 	if b.ticker != nil {
 		<-b.doneCh
 	}
-	return b.Flush(ctx)
+	err := b.Flush(ctx)
+	b.mu.Lock()
+	left := len(b.buffers)
+	b.buffers = map[string]eventPatch{}
+	b.mu.Unlock()
+	if left > 0 {
+		b.client.warn("events.close_dropped",
+			"raindrop: close deadline passed; dropping interaction updates that were not sent", "events", left)
+	}
+	return err
 }
 
 func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
@@ -164,6 +303,19 @@ func (b *eventBuffer) flushOne(ctx context.Context, eventID string) error {
 	}
 
 	if err := b.client.transport.postJSON(ctx, "events/track_partial", payload); err != nil {
+		if isPermanentRejection(err) {
+			// Rejected for good (already warned): resending would fail the
+			// same way, so drop it rather than retry it on every flush.
+			return nil
+		}
+		if ctx.Err() != nil && !isUnsent(err) {
+			// Cut off mid-request at the deadline: it may already have
+			// reached ingest, so it is dropped rather than resent
+			// (CONTRACT 1.2.1).
+			b.client.warn("events.dropped",
+				"raindrop: an interaction update was cut off at the deadline; dropping it", "event_id", eventID)
+			return err
+		}
 		b.restore(eventID, patch)
 		return err
 	}
@@ -282,9 +434,9 @@ func (b *eventBuffer) appGitSnapshot(eventID string) (appGitSnapshot, bool) {
 
 type trackPartialPayload struct {
 	EventID     string         `json:"event_id"`
-	UserID      string         `json:"user_id"`
-	Event       string         `json:"event"`
-	Timestamp   string         `json:"timestamp"`
+	UserID      string         `json:"user_id,omitempty"`
+	Event       string         `json:"event,omitempty"`
+	Timestamp   string         `json:"timestamp,omitempty"`
 	AIData      *aiDataPayload `json:"ai_data,omitempty"`
 	Properties  map[string]any `json:"properties"`
 	Attachments []Attachment   `json:"attachments"`
@@ -307,16 +459,27 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 	if userID == "" {
 		userID = sticky.UserID
 	}
-	if userID == "" {
-		c.debugLog("skipping track_partial: missing userID", "event_id", eventID)
+	if userID == "" && !sticky.Resumed {
+		// A user id is real or absent: an event begun without one is not
+		// sent (CONTRACT 10.1).
+		c.warn("partial.missing_user",
+			"raindrop: not sending event: it has no user id (pass UserID to Begin)",
+			"event_id", eventID)
 		return nil
+	}
+	if userID == "" {
+		// Still sent: ingest uses the user it stored for this event
+		// (CONTRACT 9.2).
+		c.warn("partial.resumed_without_user",
+			"raindrop: sending an update for a resumed event without a user id; ingest uses the user it already has",
+			"event_id", eventID)
 	}
 
 	eventName := patch.EventName
 	if eventName == "" {
 		eventName = sticky.EventName
 	}
-	if eventName == "" {
+	if eventName == "" && !sticky.Resumed {
 		eventName = defaultEventName
 	}
 
@@ -354,7 +517,7 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 		EventID:     eventID,
 		UserID:      userID,
 		Event:       eventName,
-		Timestamp:   iso8601Timestamp(patch.Timestamp),
+		Timestamp:   optionalTimestamp(sticky.StartedAt),
 		Properties:  properties,
 		Attachments: attachments,
 		IsPending:   isPending,

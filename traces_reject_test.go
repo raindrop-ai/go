@@ -3,7 +3,6 @@ package raindrop
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -36,10 +35,10 @@ func TestRejectedTraceBatchIsDroppedAndLaterSpansAreDelivered(t *testing.T) {
 	buffer := newTraceBuffer(client, 0, 1, 100) // one span per batch, no background flusher
 	buffer.queue = []otlpSpan{{Name: "rejected"}, {Name: "later"}}
 
-	err := buffer.Flush(context.Background())
-	var statusErr *httpStatusError
-	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
-		t.Fatalf("Flush() error = %v, want the 400 of the rejected batch", err)
+	// A permanent rejection was delivered and rejected: it is dropped, and
+	// it is not a flush failure (CONTRACT 1.2.1).
+	if err := buffer.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v, want nil (a permanent rejection is not a flush failure)", err)
 	}
 	if err := buffer.Flush(context.Background()); err != nil {
 		t.Fatalf("second Flush() error = %v, want nil (rejected batch must not be resent)", err)

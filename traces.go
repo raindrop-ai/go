@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"sync"
 	"time"
 )
@@ -16,25 +15,41 @@ type SpanOptions struct {
 	Properties map[string]any
 	Attributes []Attribute
 	StartTime  time.Time
+	// ParentContext places the span under a span this process never saw,
+	// such as ids another process saved with the event. Parent wins when
+	// both are set.
+	ParentContext *SpanContext
+}
+
+// SpanContext identifies a span by its W3C ids, lowercase hex: a 32-character
+// trace id and a 16-character span id.
+type SpanContext struct {
+	TraceID string
+	SpanID  string
 }
 
 type ToolOptions struct {
-	Parent     *Span
-	Properties map[string]any
-	Input      any
-	StartTime  time.Time
+	Parent        *Span
+	ParentContext *SpanContext
+	Properties    map[string]any
+	Input         any
+	StartTime     time.Time
 }
 
+// TrackToolOptions records a tool call after the fact: StartTime plus
+// Duration or EndTime (EndTime wins when both are set). ParentContext places
+// it under a saved parent span (CONTRACT 12.2).
 type TrackToolOptions struct {
-	Name       string
-	Parent     *Span
-	Input      any
-	Output     any
-	Error      error
-	Properties map[string]any
-	StartTime  time.Time
-	EndTime    time.Time
-	Duration   time.Duration
+	Name          string
+	Parent        *Span
+	ParentContext *SpanContext
+	Input         any
+	Output        any
+	Error         error
+	Properties    map[string]any
+	StartTime     time.Time
+	EndTime       time.Time
+	Duration      time.Duration
 }
 
 type Span struct {
@@ -165,19 +180,26 @@ func (b *traceBuffer) Flush(ctx context.Context) error {
 
 		payload := buildExportTraceServiceRequest(batch, b.client.serviceName, b.client.version)
 		if err := b.client.transport.postJSON(ctx, "traces", payload); err != nil {
+			var unencodable *json.UnsupportedValueError
+			if isPermanentRejection(err) || errors.As(err, &unencodable) {
+				// Resending would fail the same way forever, so drop the batch
+				// rather than block later spans. Delivered and rejected (or
+				// never sendable): not a flush failure.
+				b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
+				continue
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
-			var statusErr *httpStatusError
-			var unencodable *json.UnsupportedValueError
-			rejected := errors.As(err, &statusErr) && statusErr.StatusCode >= 400 && statusErr.StatusCode < 500 &&
-				statusErr.StatusCode != http.StatusRequestTimeout && statusErr.StatusCode != http.StatusTooManyRequests
-			if !rejected && !errors.As(err, &unencodable) {
-				b.restoreBatch(batch)
+			if ctx.Err() != nil && !isUnsent(err) {
+				// Cut off mid-request at the deadline: it may already have
+				// reached ingest, so it is dropped rather than resent.
+				b.client.warn("traces.dropped",
+					"raindrop: a trace batch was cut off at the deadline; dropping it", "spans", len(batch))
 				return firstErr
 			}
-			// Resending would fail the same way forever, so drop the batch rather than block later spans.
-			b.client.debugLog("dropping rejected trace batch", "spans", len(batch), "error", err)
+			b.restoreBatch(batch)
+			return firstErr
 		}
 	}
 }
@@ -193,7 +215,16 @@ func (b *traceBuffer) Stop(ctx context.Context) error {
 	if b.ticker != nil {
 		<-b.doneCh
 	}
-	return b.Flush(ctx)
+	err := b.Flush(ctx)
+	b.mu.Lock()
+	left := len(b.queue)
+	b.queue = nil
+	b.mu.Unlock()
+	if left > 0 {
+		b.client.warn("traces.close_dropped",
+			"raindrop: close deadline passed; dropping spans that were not sent", "spans", left)
+	}
+	return err
 }
 
 func (b *traceBuffer) takeBatch() []otlpSpan {
@@ -256,6 +287,9 @@ func (c *Client) StartSpan(ctx context.Context, opts SpanOptions) *Span {
 	appGit = appGitForSpan(appGit, opts.Properties, opts.Attributes, c.textFieldLimit())
 
 	ids, err := createSpanIDs(parent)
+	if err == nil && parent == nil && opts.ParentContext != nil {
+		ids, err = spanIDsUnder(*opts.ParentContext, ids)
+	}
 	if err != nil {
 		c.debugLog("failed to create span IDs", "error", err)
 		return &Span{}
@@ -312,6 +346,9 @@ func (i *Interaction) StartSpan(opts SpanOptions) *Span {
 	if opts.EventID == "" {
 		opts.EventID = i.eventID
 	}
+	if len(i.spanAttributes) > 0 {
+		opts.Attributes = append(append([]Attribute{}, opts.Attributes...), i.spanAttributes...)
+	}
 	span := i.client.StartSpan(i.ctx, opts)
 	if span != nil && opts.Parent == nil && SpanFromContext(i.ctx) == nil {
 		span.mu.Lock()
@@ -353,12 +390,13 @@ func (i *Interaction) StartToolSpan(name string, opts ToolOptions) *ToolSpan {
 		}
 	}
 	span := i.StartSpan(SpanOptions{
-		Name:       name,
-		EventID:    i.eventID,
-		Parent:     opts.Parent,
-		StartTime:  opts.StartTime,
-		Properties: properties,
-		Attributes: buildToolAttributes(name, opts.Input, nil, 0, nil, i.client.textFieldLimit()),
+		Name:          name,
+		EventID:       i.eventID,
+		Parent:        opts.Parent,
+		ParentContext: opts.ParentContext,
+		StartTime:     opts.StartTime,
+		Properties:    properties,
+		Attributes:    buildToolAttributes(name, opts.Input, nil, 0, nil, i.client.textFieldLimit()),
 	})
 	return &ToolSpan{
 		span:  span,
@@ -406,13 +444,18 @@ func (t *Tracer) TrackTool(opts TrackToolOptions) {
 	if startTime.IsZero() && opts.Duration > 0 {
 		startTime = time.Now().UTC().Add(-opts.Duration)
 	}
+	if endTime.IsZero() && !startTime.IsZero() && opts.Duration > 0 {
+		// Start plus duration fixes the end exactly (CONTRACT 12.1).
+		endTime = startTime.Add(opts.Duration)
+	}
 
 	span := t.StartSpan(SpanOptions{
-		Name:       opts.Name,
-		Parent:     opts.Parent,
-		StartTime:  startTime,
-		Properties: opts.Properties,
-		Attributes: buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, nil, t.client.textFieldLimit()),
+		Name:          opts.Name,
+		Parent:        opts.Parent,
+		ParentContext: opts.ParentContext,
+		StartTime:     startTime,
+		Properties:    opts.Properties,
+		Attributes:    buildToolAttributes(opts.Name, opts.Input, opts.Output, 0, nil, t.client.textFieldLimit()),
 	})
 	if opts.Error != nil {
 		span.SetError(opts.Error)
@@ -441,12 +484,17 @@ func (i *Interaction) TrackTool(opts TrackToolOptions) {
 	if startTime.IsZero() && opts.Duration > 0 {
 		startTime = time.Now().UTC().Add(-opts.Duration)
 	}
+	if endTime.IsZero() && !startTime.IsZero() && opts.Duration > 0 {
+		// Start plus duration fixes the end exactly (CONTRACT 12.1).
+		endTime = startTime.Add(opts.Duration)
+	}
 
 	toolSpan := i.StartToolSpan(opts.Name, ToolOptions{
-		Parent:     opts.Parent,
-		Properties: opts.Properties,
-		Input:      opts.Input,
-		StartTime:  startTime,
+		Parent:        opts.Parent,
+		ParentContext: opts.ParentContext,
+		Properties:    opts.Properties,
+		Input:         opts.Input,
+		StartTime:     startTime,
 	})
 	toolSpan.SetOutput(opts.Output)
 	if opts.Error != nil {

@@ -105,7 +105,7 @@ func main() {
 	captured := make(chan capturedEvent, 1)
 	requestErrors := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/events/track_partial" {
+		if request.URL.Path != "/events/track" {
 			select {
 			case requestErrors <- fmt.Errorf("unexpected path %q", request.URL.Path):
 			default:
@@ -113,8 +113,8 @@ func main() {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		var event capturedEvent
-		if err := json.NewDecoder(request.Body).Decode(&event); err != nil {
+		var events []capturedEvent
+		if err := json.NewDecoder(request.Body).Decode(&events); err != nil || len(events) == 0 {
 			select {
 			case requestErrors <- err:
 			default:
@@ -122,7 +122,7 @@ func main() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		captured <- event
+		captured <- events[0]
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()

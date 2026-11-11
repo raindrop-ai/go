@@ -13,6 +13,10 @@ type Signal struct {
 	Timestamp    time.Time
 	Properties   map[string]any
 	AttachmentID string
+	// Comment is free-text feedback attached to the signal.
+	Comment string
+	// After is the corrected or preferred output, for edit-style signals.
+	After string
 }
 
 type signalPayload struct {
@@ -23,6 +27,8 @@ type signalPayload struct {
 	Timestamp    string         `json:"timestamp,omitempty"`
 	Properties   map[string]any `json:"properties,omitempty"`
 	AttachmentID string         `json:"attachment_id,omitempty"`
+	Comment      string         `json:"comment,omitempty"`
+	After        string         `json:"after,omitempty"`
 }
 
 func (c *Client) TrackSignal(ctx context.Context, signal Signal) error {
@@ -33,18 +39,19 @@ func (c *Client) TrackSignal(ctx context.Context, signal Signal) error {
 		return err
 	}
 
-	payload := []signalPayload{
-		{
-			EventID:      signal.EventID,
-			SignalName:   signal.Name,
-			SignalType:   signalTypeOrDefault(signal.Type),
-			Sentiment:    signal.Sentiment,
-			Timestamp:    optionalTimestamp(signal.Timestamp),
-			Properties:   cloneMap(signal.Properties),
-			AttachmentID: signal.AttachmentID,
-		},
-	}
-	return c.transport.postJSON(ctx, "signals/track", payload)
+	// Queued, never sent on the caller (CONTRACT 1.1).
+	c.track.Enqueue(routeSignalsTrack, signalPayload{
+		EventID:      signal.EventID,
+		SignalName:   signal.Name,
+		SignalType:   signalTypeOrDefault(signal.Type),
+		Sentiment:    signal.Sentiment,
+		Timestamp:    optionalTimestamp(signal.Timestamp),
+		Properties:   cloneMap(signal.Properties),
+		AttachmentID: signal.AttachmentID,
+		Comment:      signal.Comment,
+		After:        signal.After,
+	})
+	return nil
 }
 
 func signalTypeOrDefault(value string) string {

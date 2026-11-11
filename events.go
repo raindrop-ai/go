@@ -75,50 +75,87 @@ type Interaction struct {
 	eventID string
 	mu      sync.RWMutex
 	appGit  appGitSnapshot
+
+	// spanAttributes go on every span this interaction starts: for a
+	// detached sub-agent's own run, its reverse link to the launcher
+	// (CONTRACT 13.2).
+	spanAttributes []Attribute
 }
 
+// TrackEvent queues a complete plain event for events/track. It never does
+// network I/O on the caller (CONTRACT 1.1): delivery happens on the
+// background goroutine, Flush or Close. An event without a user id is not
+// sent (CONTRACT 10.1).
 func (c *Client) TrackEvent(ctx context.Context, event Event) error {
-	eventID := event.EventID
-	if eventID == "" {
-		var err error
-		eventID, err = newEventID()
-		if err != nil {
-			return err
-		}
-	}
-	done := false
-	return c.Patch(ctx, eventID, PatchOptions{
-		UserID:      event.UserID,
-		Event:       eventNameOrDefault(event.Event),
-		Timestamp:   event.Timestamp,
-		Properties:  cloneMap(event.Properties),
-		Attachments: cloneAttachments(event.Attachments),
-		IsPending:   &done,
-	})
+	return c.trackComplete(event.EventID, event.UserID, event.Event, event.Timestamp,
+		event.Properties, event.Attachments, nil)
 }
 
+// TrackAI queues a complete AI event for events/track; see TrackEvent.
 func (c *Client) TrackAI(ctx context.Context, event AIEvent) error {
-	eventID := event.EventID
+	limit := c.textFieldLimit()
+	var ai *aiDataPayload
+	if event.Input != "" || event.Output != "" || event.Model != "" || event.ConvoID != "" {
+		ai = &aiDataPayload{
+			Input:   capText(event.Input, limit),
+			Output:  capText(event.Output, limit),
+			Model:   event.Model,
+			ConvoID: event.ConvoID,
+		}
+	}
+	return c.trackComplete(event.EventID, event.UserID, event.Event, event.Timestamp,
+		event.Properties, event.Attachments, ai)
+}
+
+type trackEventPayload struct {
+	EventID     string         `json:"event_id"`
+	UserID      string         `json:"user_id"`
+	Event       string         `json:"event"`
+	Timestamp   string         `json:"timestamp"`
+	Properties  map[string]any `json:"properties"`
+	AIData      *aiDataPayload `json:"ai_data,omitempty"`
+	Attachments []Attachment   `json:"attachments,omitempty"`
+}
+
+func (c *Client) trackComplete(eventID, userID, name string, timestamp time.Time, properties map[string]any, attachments []Attachment, ai *aiDataPayload) error {
+	if c == nil || !c.enabled {
+		return nil
+	}
+	if err := c.ensureOpen(); err != nil {
+		return err
+	}
+	if userID == "" {
+		c.warn("track.missing_user", "raindrop: not sending event: it has no user id", "event", name)
+		return nil
+	}
 	if eventID == "" {
-		var err error
-		eventID, err = newEventID()
+		generated, err := newEventID()
 		if err != nil {
 			return err
 		}
+		eventID = generated
 	}
-	done := false
-	return c.Patch(ctx, eventID, PatchOptions{
-		UserID:      event.UserID,
-		Event:       eventNameOrDefault(event.Event),
-		Timestamp:   event.Timestamp,
-		Input:       event.Input,
-		Output:      event.Output,
-		Model:       event.Model,
-		ConvoID:     event.ConvoID,
-		Properties:  cloneMap(event.Properties),
-		Attachments: cloneAttachments(event.Attachments),
-		IsPending:   &done,
+	limit := c.textFieldLimit()
+	props := capProperties(properties, limit)
+	if props == nil {
+		props = make(map[string]any, 1)
+	}
+	for key, value := range appGitWithPropertyOverrides(c.appGitSnapshot(), properties).properties {
+		if _, exists := props[key]; !exists {
+			props[key] = value
+		}
+	}
+	props["$context"] = cloneMap(c.contextData)
+	c.track.Enqueue(routeEventsTrack, trackEventPayload{
+		EventID:     eventID,
+		UserID:      userID,
+		Event:       eventNameOrDefault(name),
+		Timestamp:   iso8601Timestamp(timestamp),
+		Properties:  props,
+		AIData:      ai,
+		Attachments: capAttachments(attachments, limit),
 	})
+	return nil
 }
 
 func (c *Client) Begin(ctx context.Context, opts BeginOptions) *Interaction {
@@ -154,7 +191,27 @@ func (c *Client) Begin(ctx context.Context, opts BeginOptions) *Interaction {
 	return interaction
 }
 
+// ResumeOptions is identity to attach when continuing an event begun
+// elsewhere. Every field is optional: what is omitted is never sent, so the
+// user, conversation and name ingest already stored are kept.
+type ResumeOptions struct {
+	UserID  string
+	ConvoID string
+	Event   string
+}
+
+// ResumeInteraction returns a handle for eventID. Within this process it
+// returns the open interaction; for an event begun elsewhere (another
+// process, a queue worker, a later request) it continues that event by id,
+// like Resume with no options.
 func (c *Client) ResumeInteraction(eventID string) *Interaction {
+	return c.Resume(eventID, ResumeOptions{})
+}
+
+// Resume continues an event begun elsewhere using only its id (CONTRACT
+// 9.2). Later Patch and Finish calls are sent even without a user id, and
+// carry only the fields they (or opts) supply.
+func (c *Client) Resume(eventID string, opts ResumeOptions) *Interaction {
 	if c == nil || eventID == "" {
 		return &Interaction{}
 	}
@@ -163,6 +220,7 @@ func (c *Client) ResumeInteraction(eventID string) *Interaction {
 			return typed
 		}
 	}
+	c.events.markResumed(eventID, opts)
 	appGit := c.appGitSnapshot()
 	if buffered, ok := c.events.appGitSnapshot(eventID); ok {
 		appGit = buffered

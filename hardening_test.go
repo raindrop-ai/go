@@ -166,10 +166,13 @@ func TestPerAttemptTimeoutBoundsClientWithoutTimeout(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	start := time.Now()
-	err := client.TrackAI(context.Background(), AIEvent{
+	if err := client.TrackAI(context.Background(), AIEvent{
 		EventID: "evt_no_timeout",
 		UserID:  "user-123",
-	})
+	}); err != nil {
+		t.Fatalf("track ai: %v", err)
+	}
+	err := client.Flush(context.Background())
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -202,6 +205,9 @@ func TestPerAttemptTimeoutFailuresAreRetried(t *testing.T) {
 		EventID: "evt_retry_after_timeout",
 		UserID:  "user-123",
 	}); err != nil {
+		t.Fatalf("track ai: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("expected attempt timeouts to stay retryable: %v", err)
 	}
 	if hits.Load() != 3 {
@@ -330,8 +336,8 @@ func TestWithCloseTimeoutValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newTestClient(t, "http://localhost:1/", WithCloseTimeout(tt.timeout))
 			defer func() { _ = client.Close() }()
-			if client.closeTimeout != tt.want {
-				t.Fatalf("closeTimeout = %s, want %s", client.closeTimeout, tt.want)
+			if client.flushTimeout != tt.want {
+				t.Fatalf("flushTimeout = %s, want %s", client.flushTimeout, tt.want)
 			}
 		})
 	}
