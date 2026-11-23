@@ -40,6 +40,7 @@ type Client struct {
 	maxTextFieldChars int
 	flushTimeout      time.Duration
 	appGit            *appGitState
+	mask              MaskFunc
 
 	closeOnce sync.Once
 	closed    bool
@@ -72,6 +73,7 @@ func New(opts ...Option) (*Client, error) {
 		version:           cfg.serviceVersion,
 		maxTextFieldChars: cfg.maxTextFieldChars,
 		flushTimeout:      cfg.flushTimeout,
+		mask:              cfg.mask,
 		contextData: map[string]any{
 			"library": map[string]any{
 				"name":    cfg.libraryName,

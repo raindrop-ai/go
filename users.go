@@ -22,7 +22,7 @@ func (c *Client) Identify(ctx context.Context, user User) error {
 
 	payload := identifyPayload{
 		UserID: user.UserID,
-		Traits: cloneMap(user.Traits),
+		Traits: c.maskMap(MaskKindIdentify, "traits", cloneMap(user.Traits)),
 	}
 	if payload.Traits == nil {
 		payload.Traits = map[string]any{}

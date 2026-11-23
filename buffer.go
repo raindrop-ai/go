@@ -488,7 +488,9 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 		convoID = sticky.ConvoID
 	}
 
-	properties := cloneMap(patch.Properties)
+	// The caller's mask (WithMask) runs on every request, on the content this
+	// request carries, before the SDK adds its own properties.
+	properties := c.maskMap(MaskKindEvent, "properties", cloneMap(patch.Properties))
 	if properties == nil {
 		properties = make(map[string]any, 1)
 	}
@@ -501,7 +503,7 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 	}
 	properties["$context"] = cloneMap(c.contextData)
 
-	attachments := cloneAttachments(patch.Attachments)
+	attachments := c.maskAttachments(cloneAttachments(patch.Attachments))
 	if attachments == nil {
 		attachments = []Attachment{}
 	}
@@ -525,8 +527,8 @@ func (c *Client) buildTrackPartialPayload(eventID string, patch eventPatch, stic
 
 	if patch.Input != "" || patch.Output != "" || patch.Model != "" || convoID != "" {
 		payload.AIData = &aiDataPayload{
-			Input:   patch.Input,
-			Output:  patch.Output,
+			Input:   c.maskString(MaskKindEvent, "ai_data.input", patch.Input),
+			Output:  c.maskString(MaskKindEvent, "ai_data.output", patch.Output),
 			Model:   patch.Model,
 			ConvoID: convoID,
 		}

@@ -136,7 +136,13 @@ func (c *Client) trackComplete(eventID, userID, name string, timestamp time.Time
 		eventID = generated
 	}
 	limit := c.textFieldLimit()
-	props := capProperties(properties, limit)
+	// The caller's mask (WithMask) sees only caller content: it runs before
+	// the SDK adds its own properties, and never on identity fields.
+	props := c.maskMap(MaskKindEvent, "properties", capProperties(properties, limit))
+	if ai != nil {
+		ai.Input = c.maskString(MaskKindEvent, "ai_data.input", ai.Input)
+		ai.Output = c.maskString(MaskKindEvent, "ai_data.output", ai.Output)
+	}
 	if props == nil {
 		props = make(map[string]any, 1)
 	}
@@ -153,7 +159,7 @@ func (c *Client) trackComplete(eventID, userID, name string, timestamp time.Time
 		Timestamp:   iso8601Timestamp(timestamp),
 		Properties:  props,
 		AIData:      ai,
-		Attachments: capAttachments(attachments, limit),
+		Attachments: c.maskAttachments(capAttachments(attachments, limit)),
 	})
 	return nil
 }

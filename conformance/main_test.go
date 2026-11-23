@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	raindrop "github.com/raindrop-ai/go"
 )
 
 func TestAppGitArgAcceptsPublicVocabulary(t *testing.T) {
@@ -88,5 +90,53 @@ func TestDriverAppGitUsesPublicSDKOption(t *testing.T) {
 	}
 	if got := payload.Properties["raindrop.app.branch"]; got != "driver-branch" {
 		t.Fatalf("branch = %#v", got)
+	}
+}
+
+func TestTestMasksMatchTheHarnessTable(t *testing.T) {
+	ctx := raindrop.MaskContext{Kind: raindrop.MaskKindSignal, Field: "properties"}
+	tag, err := testMask("tag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tag("x", raindrop.MaskContext{Kind: raindrop.MaskKindEvent, Field: "ai_data.input"}); got != "<MASKED event ai_data.input>" {
+		t.Fatalf("tag string = %#v", got)
+	}
+	if got, ok := tag(map[string]any{"a": 1}, ctx).(map[string]any); !ok || len(got) != 1 || got["masked"] != "signal properties" {
+		t.Fatalf("tag object = %#v", got)
+	}
+	if got, ok := tag([]raindrop.Attachment{{Value: "x"}}, ctx).([]raindrop.Attachment); !ok || len(got) != 0 {
+		t.Fatalf("tag attachments = %#v", got)
+	}
+
+	suffix, err := testMask("suffix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := suffix("hi", ctx); got != "hi"+maskSuffix {
+		t.Fatalf("suffix string = %#v", got)
+	}
+	object := map[string]any{"a": "b"}
+	if got, ok := suffix(object, ctx).(map[string]any); !ok || got["a"] != "b" {
+		t.Fatalf("suffix object = %#v", got)
+	}
+
+	throw, err := testMask("throw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("throw mask did not panic")
+			}
+		}()
+		throw("x", ctx)
+	}()
+
+	for _, bad := range []any{"", "TAG", true, nil} {
+		if _, err := testMask(bad); err == nil {
+			t.Fatalf("mask %#v unexpectedly accepted", bad)
+		}
 	}
 }
