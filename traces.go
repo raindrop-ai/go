@@ -587,6 +587,9 @@ func (s *Span) EndAt(endTime time.Time) {
 	}
 	s.mu.Unlock()
 
+	// The caller's mask (WithMask) runs once per span, as it is finished,
+	// outside the span's lock.
+	span.Attributes, span.Status = s.client.maskSpan(span.Attributes, span.Status)
 	s.client.traces.Enqueue(span)
 }
 

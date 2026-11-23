@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	driverVersion = "1.2.0"
+	driverVersion = "1.3.0"
 	protocolMajor = 1
 	sdkName       = "go"
 )
@@ -76,6 +76,9 @@ var (
 		// init.flush_timeout_ms -> WithFlushTimeout, the one Flush/Close
 		// deadline (CONTRACT 1.2.1).
 		"lifecycle.flush_timeout",
+		// init.mask -> WithMask with one of the harness's fixed test masks
+		// (README "Test masks").
+		"privacy.mask",
 		// `wait`: sleep without an SDK call, so background delivery is
 		// observable without an explicit flush.
 		"timing.wait",
@@ -300,6 +303,13 @@ func (d *driver) stepInit(args map[string]any) error {
 		}
 		opts = append(opts, raindrop.WithFlushTimeout(time.Duration(ms)*time.Millisecond))
 	}
+	if raw, ok := args["mask"]; ok {
+		mask, err := testMask(raw)
+		if err != nil {
+			return fmt.Errorf("init: %w", err)
+		}
+		opts = append(opts, raindrop.WithMask(mask))
+	}
 	sink := strings.TrimRight(strings.TrimSpace(os.Getenv("RAINDROP_SINK_URL")), "/")
 	if sink == "" {
 		// A missing sink must never fall through to the SDK's production
@@ -317,6 +327,42 @@ func (d *driver) stepInit(args map[string]any) error {
 	}
 	d.client = client
 	return nil
+}
+
+// maskSuffix is what the harness's `suffix` test mask appends to every string.
+const maskSuffix = " [masked by ops@example.com]"
+
+// testMask returns the fixed test mask `init.mask` names (harness README
+// "Test masks"): `tag` replaces each value with its kind and field, `throw`
+// panics on every value, `suffix` appends maskSuffix to strings.
+func testMask(raw any) (raindrop.MaskFunc, error) {
+	name, _ := raw.(string)
+	switch name {
+	case "tag":
+		return func(value any, ctx raindrop.MaskContext) any {
+			label := string(ctx.Kind) + " " + ctx.Field
+			switch value.(type) {
+			case string:
+				return "<MASKED " + label + ">"
+			case []raindrop.Attachment:
+				return []raindrop.Attachment{}
+			default:
+				return map[string]any{"masked": label}
+			}
+		}, nil
+	case "throw":
+		return func(any, raindrop.MaskContext) any {
+			panic("test mask: throw")
+		}, nil
+	case "suffix":
+		return func(value any, _ raindrop.MaskContext) any {
+			if s, ok := value.(string); ok {
+				return s + maskSuffix
+			}
+			return value
+		}, nil
+	}
+	return nil, fmt.Errorf("arg \"mask\": expected \"tag\", \"throw\" or \"suffix\", got %v", raw)
 }
 
 func appGitArg(args map[string]any) (raindrop.Option, error) {

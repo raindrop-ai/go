@@ -32,6 +32,7 @@ type config struct {
 	maxTextFieldChars    int
 	flushTimeout         time.Duration
 	appGit               appGitConfig
+	mask                 MaskFunc
 }
 
 func defaultConfig() config {

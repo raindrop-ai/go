@@ -39,6 +39,24 @@ func (c *Client) TrackSignal(ctx context.Context, signal Signal) error {
 		return err
 	}
 
+	properties := cloneMap(signal.Properties)
+	comment, after := signal.Comment, signal.After
+	if c.mask != nil && (comment != "" || after != "") {
+		// The mask sees the comment and after text inside properties, where
+		// ingest stores them, so they are masked with the rest and not sent
+		// separately.
+		if properties == nil {
+			properties = make(map[string]any, 2)
+		}
+		if comment != "" {
+			properties["comment"] = comment
+		}
+		if after != "" {
+			properties["after"] = after
+		}
+		comment, after = "", ""
+	}
+
 	// Queued, never sent on the caller (CONTRACT 1.1).
 	c.track.Enqueue(routeSignalsTrack, signalPayload{
 		EventID:      signal.EventID,
@@ -46,10 +64,10 @@ func (c *Client) TrackSignal(ctx context.Context, signal Signal) error {
 		SignalType:   signalTypeOrDefault(signal.Type),
 		Sentiment:    signal.Sentiment,
 		Timestamp:    optionalTimestamp(signal.Timestamp),
-		Properties:   cloneMap(signal.Properties),
+		Properties:   c.maskMap(MaskKindSignal, "properties", properties),
 		AttachmentID: signal.AttachmentID,
-		Comment:      signal.Comment,
-		After:        signal.After,
+		Comment:      comment,
+		After:        after,
 	})
 	return nil
 }
